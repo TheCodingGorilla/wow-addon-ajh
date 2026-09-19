@@ -1,0 +1,5 @@
+<Bindings>
+	<Binding name="AJH_TOGGLE" header="AJH" category="ADDONS">
+		AJH_TogglePanel();
+	</Binding>
+</Bindings>
