@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.3
+
+**Hotfix — progress now stored where Forever actually loads it**
+
+- **Root cause:** on Forever, per-character SavedVariables often never populate in memory on login even when the character file on disk is correct. Empty sessions then overwrite the good file on logout.
+- Progress is now stored in **account** SavedVariables (`AJHAccount`, keyed by character), which this client loads and saves reliably
+- Older per-character data is raise-merged into the account store when present
+- Update and log in — no commands needed
+
 ## 1.1.2
 
 **Hotfix — progress persistence (update and log in, no commands)**
