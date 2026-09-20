@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.2
+## 1.1.1
 
 **Hotfix — progress wipe on login**
 
@@ -8,11 +8,7 @@
 - Empty or partial logins can no longer overwrite a higher saved total
 - On login, AJH automatically restores the best matching account backup for your character
 
-Just update and log in. If progress was wiped by 1.1.0, logging in on 1.1.2 should bring it back automatically.
-
-## 1.1.1
-
-- Persistence hardening (superseded by 1.1.2)
+Just update and log in. If progress was wiped by 1.1.0, logging in on 1.1.1 should bring it back automatically.
 
 ## 1.1.0
 
