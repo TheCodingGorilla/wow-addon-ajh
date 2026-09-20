@@ -44,22 +44,29 @@ local function ToNumberOr(value, fallback)
 	return fallback
 end
 
+-- Character SavedVariables only (AJHDB).
+-- AJHGlobalDB is declared only so older 1.1.x installs can be migrated once;
+-- we never write progress into it anymore.
+
 local function EnsureDB()
+	-- Never replace an existing AJHDB table — only fill missing fields.
 	if type(AJHDB) ~= "table" then
 		AJHDB = {}
 	end
 
-	AJHDB.jumps = ToNumberOr(AJHDB.jumps, AJHDB.jumps)
-	if type(AJHDB.jumps) ~= "number" then
-		AJHDB.jumps = 0
+	local jumps = ToNumberOr(AJHDB.jumps, nil)
+	if type(jumps) ~= "number" then
+		jumps = 0
 	end
+	AJHDB.jumps = jumps
 
-	AJHDB.xp = ToNumberOr(AJHDB.xp, AJHDB.xp)
-	if type(AJHDB.xp) ~= "number" then
-		AJHDB.xp = AJHDB.jumps * XP_PER_JUMP
-	elseif AJHDB.jumps > 0 and AJHDB.xp == AJHDB.jumps * 10 then
-		AJHDB.xp = AJHDB.jumps
+	local xp = ToNumberOr(AJHDB.xp, nil)
+	if type(xp) ~= "number" then
+		xp = AJHDB.jumps * XP_PER_JUMP
+	elseif AJHDB.jumps > 0 and xp == AJHDB.jumps * 10 then
+		xp = AJHDB.jumps
 	end
+	AJHDB.xp = xp
 
 	if type(AJHDB.board) ~= "table" then
 		AJHDB.board = {}
@@ -141,272 +148,127 @@ local function EnsureDB()
 	end
 end
 
-local function CopyAchievements(src)
-	local out = {}
-	if type(src) ~= "table" then
-		return out
-	end
-	for id, when in pairs(src) do
-		out[id] = when
-	end
-	return out
-end
-
-local function PlayerNameRealmKey()
-	local name, realm = UnitFullName("player")
-	if not name or name == "" then
-		name = UnitName("player")
-	end
-	if not name or name == "" then
-		return nil
-	end
-	if not realm or realm == "" then
-		realm = GetNormalizedRealmName and GetNormalizedRealmName() or nil
-	end
-	if not realm or realm == "" then
-		realm = GetRealmName and GetRealmName() or "Unknown"
-	end
-	-- Keep realm labels stable across API variants.
-	realm = tostring(realm):gsub("%s+", "")
-	return string.format("%s-%s", name, realm)
-end
-
-local function PlayerBackupKeys()
-	local keys = {}
-	local seen = {}
-	local function add(key)
-		if type(key) == "string" and key ~= "" and not seen[key] then
-			seen[key] = true
-			keys[#keys + 1] = key
-		end
-	end
-
-	local guid = UnitGUID("player")
-	if guid then
-		add("guid:" .. guid)
-	end
-	add(PlayerNameRealmKey())
-
-	-- Legacy / unstable realm labels used by older builds.
-	local name = UnitName("player")
-	if name and name ~= "" then
-		add(name .. "-Unknown")
-		if GetRealmName then
-			local realm = tostring(GetRealmName() or ""):gsub("%s+", "")
-			if realm ~= "" then
-				add(name .. "-" .. realm)
-			end
-		end
-	end
-	return keys
-end
-
-local function SnapshotProgress()
-	EnsureDB()
-	return {
-		jumps = AJHDB.jumps or 0,
-		xp = AJHDB.xp or 0,
-		achievements = CopyAchievements(AJHDB.achievements),
-		minimapPos = AJHDB.minimapPos,
-		jumpXPBar = AJHDB.jumpXPBar and {
-			shown = not not AJHDB.jumpXPBar.shown,
-			point = AJHDB.jumpXPBar.point,
-			x = AJHDB.jumpXPBar.x,
-			y = AJHDB.jumpXPBar.y,
-			widthPct = AJHDB.jumpXPBar.widthPct,
-			userPlaced = not not AJHDB.jumpXPBar.userPlaced,
-		} or nil,
-		showJumpXPBar = AJHDB.jumpXPBar and AJHDB.jumpXPBar.shown or AJHDB.showJumpXPBar,
-	}
-end
-
-local function BackupScore(saved)
-	if type(saved) ~= "table" then
-		return -1
-	end
-	return ToNumberOr(saved.jumps, 0) + (ToNumberOr(saved.xp, 0) * 0.0001)
-end
-
-local function MergeBackupRecord(existing, incoming)
-	if type(existing) ~= "table" then
-		return incoming
-	end
-	if type(incoming) ~= "table" then
-		return existing
-	end
-	local out = {
-		jumps = math.max(ToNumberOr(existing.jumps, 0), ToNumberOr(incoming.jumps, 0)),
-		xp = math.max(ToNumberOr(existing.xp, 0), ToNumberOr(incoming.xp, 0)),
-		minimapPos = incoming.minimapPos or existing.minimapPos,
-		showJumpXPBar = incoming.showJumpXPBar or existing.showJumpXPBar,
-		jumpXPBar = incoming.jumpXPBar or existing.jumpXPBar,
-		achievements = CopyAchievements(existing.achievements),
-	}
-	if type(incoming.achievements) == "table" then
-		for id, when in pairs(incoming.achievements) do
-			if out.achievements[id] == nil then
-				out.achievements[id] = when
-			end
-		end
-	end
-	-- Prefer whichever side has the higher jump count for XP if tied oddly.
-	if ToNumberOr(existing.jumps, 0) > ToNumberOr(incoming.jumps, 0) then
-		out.xp = ToNumberOr(existing.xp, out.xp)
-		out.minimapPos = existing.minimapPos or out.minimapPos
-		out.jumpXPBar = existing.jumpXPBar or out.jumpXPBar
-		out.showJumpXPBar = existing.showJumpXPBar or out.showJumpXPBar
-	end
-	return out
-end
-
-local function BackupProgress()
-	EnsureDB()
-	if type(AJHGlobalDB) ~= "table" then
-		AJHGlobalDB = {}
-	end
-	local snap = SnapshotProgress()
-	local keys = PlayerBackupKeys()
-	if #keys == 0 then
-		return
-	end
-	for _, key in ipairs(keys) do
-		-- Never clobber a better account backup with weaker/empty character data.
-		AJHGlobalDB[key] = MergeBackupRecord(AJHGlobalDB[key], snap)
-	end
-end
-
--- Intentional resets must replace backups (including legacy realm keys).
-local function ForceBackupProgress()
-	EnsureDB()
-	if type(AJHGlobalDB) ~= "table" then
-		AJHGlobalDB = {}
-	end
-	local snap = SnapshotProgress()
-	local name = UnitName("player")
-	local guid = UnitGUID("player")
-	for key in pairs(AJHGlobalDB) do
-		if type(key) == "string" then
-			local drop = (guid and key == ("guid:" .. guid))
-				or (name and name ~= "" and (key == name or key:sub(1, #name + 1) == (name .. "-")))
-			if drop then
-				AJHGlobalDB[key] = nil
-			end
-		end
-	end
-	for _, key in ipairs(PlayerBackupKeys()) do
-		AJHGlobalDB[key] = snap
-	end
-end
-
-local function FindBestBackup()
-	if type(AJHGlobalDB) ~= "table" then
-		return nil
-	end
-	local best, bestScore = nil, -1
-	local keys = PlayerBackupKeys()
-	local want = {}
-	for _, key in ipairs(keys) do
-		want[key] = true
-	end
-
-	local name = UnitName("player")
-	for key, saved in pairs(AJHGlobalDB) do
-		if type(key) == "string" and type(saved) == "table" then
-			local match = want[key]
-			if not match then
-				local guid = UnitGUID("player")
-				if guid and key == ("guid:" .. guid) then
-					match = true
-				elseif name and name ~= "" and (key == name or key:sub(1, #name + 1) == (name .. "-")) then
-					match = true
-				end
-			end
-			if match then
-				local score = BackupScore(saved)
-				if score > bestScore then
-					bestScore = score
-					best = saved
-				end
-			end
-		end
-	end
-	return best
-end
-
-local function RestoreProgress()
-	EnsureDB()
-	local saved = FindBestBackup()
+local function BackupRecordMatchesPlayer(key, saved, name, guid)
 	if type(saved) ~= "table" then
 		return false
 	end
+	if type(key) == "string" then
+		if guid and (key == ("guid:" .. guid) or key == ("ceil:" .. guid)) then
+			return true
+		end
+		if name and name ~= "" then
+			if key == name or key:sub(1, #name + 1) == (name .. "-") then
+				return true
+			end
+		end
+	end
+	if name and name ~= "" and type(saved.name) == "string" and strlower(saved.name) == strlower(name) then
+		return true
+	end
+	return false
+end
 
-	local savedJumps = ToNumberOr(saved.jumps, 0)
-	local savedXp = ToNumberOr(saved.xp, savedJumps)
-	local charJumps = ToNumberOr(AJHDB.jumps, 0)
-	local charXp = ToNumberOr(AJHDB.xp, 0)
-	local restored = false
-
-	if savedJumps > charJumps then
-		AJHDB.jumps = savedJumps
-		AJHDB.xp = savedXp
-		restored = true
-	elseif savedJumps == charJumps and savedXp > charXp then
-		AJHDB.xp = savedXp
-		restored = true
+-- One-time: pull any better totals left in legacy AJHGlobalDB from 1.1.x,
+-- then retire that table. No ongoing backup writes.
+local function MigrateLegacyGlobalBackupOnce()
+	EnsureDB()
+	if AJHDB.legacyGlobalMigrated then
+		return false
 	end
 
-	if (not AJHDB.minimapPos or AJHDB.minimapPos == 210) and saved.minimapPos then
-		AJHDB.minimapPos = ToNumberOr(saved.minimapPos, 210)
+	local name = UnitName("player")
+	local guid = UnitGUID("player")
+	-- Wait until the client knows who we are so we don't retire the backup early.
+	if (not name or name == "") and (not guid or guid == "") then
+		return false
 	end
-	if type(saved.jumpXPBar) == "table" then
-		local backup = saved.jumpXPBar
-		local bar = AJHDB.jumpXPBar
-		if type(bar) ~= "table" then
-			AJHDB.jumpXPBar = {
-				shown = not not backup.shown,
-				point = backup.point,
-				x = backup.x,
-				y = backup.y,
-				widthPct = backup.widthPct,
-				userPlaced = not not backup.userPlaced,
-			}
-			restored = true
-		else
-			local charDefault = (not bar.userPlaced) and (not bar.shown)
-			if backup.userPlaced and (not bar.userPlaced or charDefault) then
-				bar.point = backup.point or bar.point
-				bar.x = backup.x or bar.x
-				bar.y = backup.y or bar.y
-				bar.widthPct = backup.widthPct or bar.widthPct
-				bar.userPlaced = true
-				restored = true
-			end
-			if backup.shown and not bar.shown then
-				bar.shown = true
-				restored = true
-			end
-			for k, v in pairs(backup) do
-				if bar[k] == nil then
-					bar[k] = v
-					restored = true
+	AJHDB.legacyGlobalMigrated = true
+
+	if type(AJHGlobalDB) ~= "table" then
+		return false
+	end
+
+	local bestJumps = 0
+	local bestXp = 0
+	local bestAchievements
+
+	for key, saved in pairs(AJHGlobalDB) do
+		if BackupRecordMatchesPlayer(key, saved, name, guid) then
+			local j = ToNumberOr(saved.jumps, 0)
+			local x = ToNumberOr(saved.xp, 0)
+			if j > bestJumps or (j == bestJumps and x > bestXp) then
+				bestJumps = j
+				bestXp = x
+				if type(saved.achievements) == "table" then
+					bestAchievements = saved.achievements
 				end
 			end
 		end
-		AJHDB.showJumpXPBar = not not AJHDB.jumpXPBar.shown
-	elseif saved.showJumpXPBar and AJHDB.jumpXPBar and not AJHDB.jumpXPBar.shown then
-		AJHDB.jumpXPBar.shown = true
-		AJHDB.showJumpXPBar = true
-		restored = true
 	end
-	if type(saved.achievements) == "table" then
-		for id, when in pairs(saved.achievements) do
+
+	local raised = false
+	if bestJumps > ToNumberOr(AJHDB.jumps, 0) then
+		AJHDB.jumps = bestJumps
+		raised = true
+	end
+	if bestXp > ToNumberOr(AJHDB.xp, 0) then
+		AJHDB.xp = bestXp
+		raised = true
+	end
+	if type(bestAchievements) == "table" then
+		for id, when in pairs(bestAchievements) do
 			if AJHDB.achievements[id] == nil then
 				AJHDB.achievements[id] = when
-				restored = true
+				raised = true
 			end
 		end
 	end
-	return restored
+
+	-- Retire legacy account DB so we never keep syncing into it.
+	wipe(AJHGlobalDB)
+
+	return raised
+end
+
+-- If jumps were zeroed but the guild board still has this character's score
+-- (same AJHDB table), take the higher value. Automatic, no commands.
+local function ReconcileTotalsFromOwnBoard()
+	if type(AJHDB) ~= "table" or type(AJHDB.board) ~= "table" then
+		return false
+	end
+	local playerName = UnitName("player")
+	if type(playerName) ~= "string" or playerName == "" then
+		return false
+	end
+	local best = 0
+	for _, entry in pairs(AJHDB.board) do
+		if type(entry) == "table" then
+			local entryName = entry.name
+			if type(entryName) == "string" and strlower(entryName) == strlower(playerName) then
+				local n = ToNumberOr(entry.jumps, 0)
+				if n > best then
+					best = n
+				end
+			end
+		end
+	end
+	if best <= ToNumberOr(AJHDB.jumps, 0) then
+		return false
+	end
+	AJHDB.jumps = best
+	if ToNumberOr(AJHDB.xp, 0) < best then
+		AJHDB.xp = best
+	end
+	return true
+end
+
+local function HealProgressOnLogin()
+	EnsureDB()
+	local raised = MigrateLegacyGlobalBackupOnce()
+	if ReconcileTotalsFromOwnBoard() then
+		raised = true
+	end
+	return raised
 end
 
 local function GetLevel(xp)
@@ -924,7 +786,6 @@ local function UnlockAchievement(ach)
 	end
 
 	AJHDB.achievements[ach.id] = time()
-	BackupProgress()
 	DEFAULT_CHAT_FRAME:AddMessage(string.format(
 		"|cff88ff88AJH:|r Achievement earned: |cffffffff%s|r - %s",
 		ach.name,
@@ -1172,7 +1033,6 @@ local function CommitJumpXPBarState(state)
 		layoutName = LibEditMode:GetActiveLayoutName() or layoutName
 	end
 	AJHDB.jumpXPBarLayouts[layoutName] = CopyJumpXPBarState(barDB)
-	BackupProgress()
 end
 
 local function PersistJumpXPBarDraft()
@@ -2526,7 +2386,6 @@ local function OnJump()
 	local oldLevel = GetLevel(AJHDB.xp)
 	AJHDB.jumps = AJHDB.jumps + 1
 	AJHDB.xp = AJHDB.xp + GetJumpXPGain()
-	BackupProgress()
 	local newLevel = GetLevel(AJHDB.xp)
 	if newLevel > oldLevel then
 		AnnounceLevelUp(newLevel)
@@ -2547,7 +2406,6 @@ end
 local loader = CreateFrame("Frame")
 loader:RegisterEvent("ADDON_LOADED")
 loader:RegisterEvent("PLAYER_LOGIN")
-loader:RegisterEvent("PLAYER_LOGOUT")
 loader:RegisterEvent("PLAYER_ENTERING_WORLD")
 loader:RegisterUnitEvent("UNIT_AURA", "player")
 loader:RegisterEvent("CHAT_MSG_ADDON")
@@ -2566,43 +2424,25 @@ loader:SetScript("OnEvent", function(self, event, ...)
 		RefreshCampBenefit()
 	elseif event == "PLAYER_LOGIN" then
 		EnsureDB()
-		-- Restore only — never backup here. An empty/mismatched character
-		-- load used to overwrite the account backup with zeros.
-		local before = ToNumberOr(AJHDB.jumps, 0)
-		if RestoreProgress() then
-			local after = ToNumberOr(AJHDB.jumps, 0)
-			if after > before then
-				DEFAULT_CHAT_FRAME:AddMessage(string.format(
-					"|cff88ff88AJH:|r Restored your Jump Habit progress (%s jumps).",
-					FormatNumber(after)
-				))
-			end
+		local healed = HealProgressOnLogin()
+		if healed then
+			DEFAULT_CHAT_FRAME:AddMessage(string.format(
+				"|cff88ff88AJH:|r Recovered your Jump Habit progress (%s jumps).",
+				FormatNumber(AJHDB.jumps)
+			))
 		end
 		RefreshCampBenefit()
 		if panel then
 			panel:Update()
 		end
 		UpdateJumpXPBar()
-	elseif event == "PLAYER_LOGOUT" then
-		BackupProgress()
 	elseif event == "UNIT_AURA" then
 		if RefreshCampBenefit() and panel and panel:IsShown() then
 			panel:Update()
 		end
 	elseif event == "PLAYER_ENTERING_WORLD" then
 		EnsureDB()
-		local before = ToNumberOr(AJHDB.jumps, 0)
-		if RestoreProgress() then
-			local after = ToNumberOr(AJHDB.jumps, 0)
-			if after > before then
-				DEFAULT_CHAT_FRAME:AddMessage(string.format(
-					"|cff88ff88AJH:|r Restored your Jump Habit progress (%s jumps).",
-					FormatNumber(after)
-				))
-			end
-		end
-		-- Safe after restore: merge-max will not lower account totals.
-		BackupProgress()
+		HealProgressOnLogin()
 		RefreshCampBenefit()
 		C_Timer.After(0, function()
 			if RefreshCampBenefit() and panel and panel:IsShown() then
@@ -2654,7 +2494,10 @@ SlashCmdList.AJH = function(msg)
 	if msg == "clear" or msg == "reset" then
 		AJHDB.jumps = 0
 		AJHDB.xp = 0
-		ForceBackupProgress()
+		local key = PlayerIdentity()
+		if key and AJHDB.board then
+			AJHDB.board[key] = nil
+		end
 		BroadcastScore()
 		DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH:|r Jump count and XP reset.")
 		if panel and panel:IsShown() then

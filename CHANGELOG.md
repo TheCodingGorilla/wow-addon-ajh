@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.2
+
+**Hotfix — progress persistence (update and log in, no commands)**
+
+- Removed the ongoing account backup/restore loop that could overwrite good progress with zeros
+- Progress lives in your character save only
+- On first login after updating, AJH silently pulls any higher totals still left in the old 1.1.x account file into your character save, then retires that file
+- If your jumps were wiped but your guild board still has your score, AJH raises jumps to match automatically
+- Never replaces an existing character save table with a blank one
+- No slash commands required for recovery
+
 ## 1.1.1
 
 **Hotfix — progress wipe on login**
