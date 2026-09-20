@@ -5,13 +5,10 @@
 **Hotfix — progress wipe on login**
 
 - Fixed Jump Habit progress being reset between sessions
-- Account backups no longer get overwritten by an empty login
-- On login, AJH restores the best matching backup for your character (including older realm-name variants)
-- Added `/ajh recover` to pull progress back from the account backup
-- Added `/ajh setprogress <jumps> [xp]` if you still need to restore known totals manually
-- Added `/ajh status` to show character and backup totals
+- Empty or partial logins can no longer overwrite a higher saved total
+- On login, AJH automatically restores the best matching account backup for your character
 
-If you logged in on 1.1.0/1.1.1 and your jumps showed as 0: update to **1.1.2**, `/reload`, then run `/ajh recover`. If that finds nothing, use `/ajh setprogress <your jumps> <your xp>`.
+Just update and log in. If progress was wiped by 1.1.0, logging in on 1.1.2 should bring it back automatically.
 
 ## 1.1.1
 

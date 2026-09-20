@@ -2568,7 +2568,16 @@ loader:SetScript("OnEvent", function(self, event, ...)
 		EnsureDB()
 		-- Restore only — never backup here. An empty/mismatched character
 		-- load used to overwrite the account backup with zeros.
-		RestoreProgress()
+		local before = ToNumberOr(AJHDB.jumps, 0)
+		if RestoreProgress() then
+			local after = ToNumberOr(AJHDB.jumps, 0)
+			if after > before then
+				DEFAULT_CHAT_FRAME:AddMessage(string.format(
+					"|cff88ff88AJH:|r Restored your Jump Habit progress (%s jumps).",
+					FormatNumber(after)
+				))
+			end
+		end
 		RefreshCampBenefit()
 		if panel then
 			panel:Update()
@@ -2582,7 +2591,17 @@ loader:SetScript("OnEvent", function(self, event, ...)
 		end
 	elseif event == "PLAYER_ENTERING_WORLD" then
 		EnsureDB()
-		RestoreProgress()
+		local before = ToNumberOr(AJHDB.jumps, 0)
+		if RestoreProgress() then
+			local after = ToNumberOr(AJHDB.jumps, 0)
+			if after > before then
+				DEFAULT_CHAT_FRAME:AddMessage(string.format(
+					"|cff88ff88AJH:|r Restored your Jump Habit progress (%s jumps).",
+					FormatNumber(after)
+				))
+			end
+		end
+		-- Safe after restore: merge-max will not lower account totals.
 		BackupProgress()
 		RefreshCampBenefit()
 		C_Timer.After(0, function()
