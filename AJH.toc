@@ -1,10 +1,11 @@
 ## Interface: 16001
 ## Title: Archindula's Jump Habit
-## Notes: Jump counter with RuneScape leveling, achievements, and guild leaderboard.
+## Notes: Jump counter with RuneScape leveling, feats, and guild leaderboard.
 ## Author: Archindula
-## Version: 1.1.3
+## Version: 1.1.7
 ## IconTexture: Interface\Icons\Spell_Shaman_Hex
-## SavedVariables: AJHAccount
+## OptionalDeps: AJHStore
+## SavedVariables: AJHAccount, AJHFloor
 ## SavedVariablesPerCharacter: AJHDB
 ## LoadSavedVariablesFirst: 1
 ## AllowLoadGameType: camelot

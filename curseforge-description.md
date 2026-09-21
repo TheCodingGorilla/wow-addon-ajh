@@ -18,7 +18,7 @@ Made for **World of Warcraft: Forever**.
 ### Panel (`/jumphabit` or `/ajh`)
 - **Habit** — level, XP bar, jumps, experience, announce buttons
 - **Levels** — full 1-99 XP table (your level highlighted)
-- **Feats** — achievements with tick / question-mark status
+- **Feats** — City / Town / dungeon / raid location feats with category browsing
 - **Guild** — shared leaderboard (jumps + feat count)
 
 ### Feats

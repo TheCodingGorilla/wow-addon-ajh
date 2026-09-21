@@ -1,5 +1,54 @@
 # Changelog
 
+## 1.1.7
+
+**Feats UI + Forever progress survival**
+
+- Feats tab organized by category: **City Jumper**, **Town Jumper**, dungeon/raid location feats (Classic only)
+- Companion addon **AJH Store** (`AJHStore`) mirrors progress to `AJHStoreDB` so Forever load misses do not wipe jumps on the next logout
+- Also mirrors into `SpaceToAcceptDB.AJH` when SpaceToAccept is present (extra safety net)
+- Raise-only merge across account / floor / character copies; blank sessions no longer invent zero account tables
+- Bind/UI wait until SavedVariables are ready; debug spam is local-dev only (`AJH_Dev`)
+- Still does **not** ship HighWater files
+
+**Install note:** enable both **Archindula's Jump Habit** and **AJH Store** in the AddOns list (same zip).
+
+Update, enable AJH Store if prompted, then `/reload` or log in.
+
+## 1.1.6
+
+**Hotfix — Jump XP bar layout + CurseForge-safe progress**
+
+- Fixed Jump XP bar size/position resetting on `/reload`
+- Hide Jump XP Bar button works again
+- Edit Mode no longer commits default drafts over your customized layout
+- Disk `.bak` hydrate works on Forever (isolated Lua env) so wiped layouts can be raised back
+- **Stopped shipping `AJH_HighWater.lua` in the zip/TOC.** Blank HighWater in every CF update was overwriting players' raised files. Durable watermarks are SavedVariables only (`AJHAccount` / `AJHFloor`); optional runtime cache is `AJH_HighWater.local.lua` (never packaged)
+- Width % is measured against the real status/XP bar only
+
+Update and `/reload` or log in.
+
+## 1.1.5
+
+**Hotfix — CurseForge update wipe + XP bar layout**
+
+- CurseForge updates replace the AddOns folder (including `AJH_HighWater.lua`), which could leave a blank session that then saved `AJHAccount = nil` over good progress
+- On blank loads, AJH now re-reads account SavedVariables / `.bak` from disk before binding or logout-save
+- Jump XP bar position/size prefer `userPlaced` / customized layouts when merging saves (no longer lose TOP/50% to defaults)
+- Bar layout is kept in the raise-only floor watermarks with jumps/XP/achievements
+
+## 1.1.4
+
+**Hotfix — survive Forever SavedVariables load misses**
+
+- **Why wipes happen:** Forever sometimes fails to load SavedVariables into memory even when the WTF files are fine. The addon then runs at 0 jumps, and logout/reload writes that empty memory back over the good files.
+- Progress bind waits until `PLAYER_LOGIN` (when name/guid are ready), so an early empty alias cannot overwrite a richer one
+- Always keep the richest copy across name, guid, character file, and account file
+- Raise-only watermarks (`AJHFloor`, account `__floor`, and `AJH_HighWater` in the addon folder when the client allows writing it) now keep jumps, XP, **and achievements**
+- Blank sessions no longer seed zero watermarks over higher totals
+- Diagnostics via `/ajh diag` (off by default)
+- Update and `/reload` or log in
+
 ## 1.1.3
 
 **Hotfix — progress now stored where Forever actually loads it**
@@ -28,7 +77,7 @@
 - Empty or partial logins can no longer overwrite a higher saved total
 - On login, AJH automatically restores the best matching account backup for your character
 
-Just update and log in. If progress was wiped by 1.1.0, logging in on 1.1.1 should bring it back automatically.
+Just update and log in. If your jumps were wiped by 1.1.0, logging in on 1.1.1 should bring it back automatically.
 
 ## 1.1.0
 

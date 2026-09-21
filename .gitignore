@@ -8,3 +8,17 @@ _stage*/
 _cf_*.json
 _cmp*/
 
+# Local-only testing marker (enables Reset feats). Never ship this.
+AJH_Dev
+
+# Bindings.xml is auto-loaded by filename. Never list it in the TOC — that
+# parses it as UI XML and causes "Unrecognized XML: Binding". The file itself
+# must ship with the addon (do not gitignore it).
+
+# NEVER ship or create HighWater files under Interface/AddOns.
+# Progress belongs only in SavedVariables (AJHAccount / AJHFloor / AJHDB).
+AJH_HighWater.lua
+AJH_HighWater.local.lua
+
+# Local planning notes — not part of the addon ship.
+roadmap.md
