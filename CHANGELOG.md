@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0
+
+**Settings, Statistics, and guild sync**
+
+- **Settings** gear tab (icon-only, last): enable sounds, sound volume (0 mutes), auto announce feats to guild
+- **Statistics** nested under Habit (Back returns to Habit main): session jumps/time/rate, recent rate, best session, jumping vs idle %, lifetime jumps/level/activity, feats %, time since last jump
+- Statistics refresh live while open; best session and activity times persist per character
+- Guild sync sends feat **count** (`Y:jumps:achs:xp`) — fixes integer overflow with many location feats; legacy mask capped to 31 bits
+- Still ships with companion **AJH Store** — enable both addons after updating
+
 ## 1.1.7
 
 **Feats UI + Forever progress survival**

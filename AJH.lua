@@ -211,6 +211,15 @@ RaiseMergeRecord = function(dest, src)
 	if RaiseNumber(dest, "xp", src.xp) then
 		raised = true
 	end
+	if RaiseNumber(dest, "playTime", src.playTime) then
+		raised = true
+	end
+	if RaiseNumber(dest, "jumpActivityTime", src.jumpActivityTime) then
+		raised = true
+	end
+	if RaiseNumber(dest, "sessionJumpHigh", src.sessionJumpHigh) then
+		raised = true
+	end
 	if type(src.achievements) == "table" then
 		if type(dest.achievements) ~= "table" then
 			dest.achievements = {}
@@ -772,6 +781,26 @@ local function FillDBDefaults(db)
 		barDB.widthPct = 100
 	end
 	db.showJumpXPBar = not not barDB.shown
+
+	if db.soundsEnabled == nil then
+		db.soundsEnabled = true
+	else
+		db.soundsEnabled = not not db.soundsEnabled
+	end
+	db.soundVolume = ToNumberOr(db.soundVolume, 100) or 100
+	if db.soundVolume < 0 then
+		db.soundVolume = 0
+	elseif db.soundVolume > 100 then
+		db.soundVolume = 100
+	end
+	if db.autoAnnounce == nil then
+		db.autoAnnounce = true
+	else
+		db.autoAnnounce = not not db.autoAnnounce
+	end
+	db.sessionJumpHigh = math.max(0, math.floor(ToNumberOr(db.sessionJumpHigh, 0) or 0))
+	db.playTime = math.max(0, ToNumberOr(db.playTime, 0) or 0)
+	db.jumpActivityTime = math.max(0, ToNumberOr(db.jumpActivityTime, 0) or 0)
 end
 
 local function RaiseFromOwnBoard(rec)
@@ -1807,7 +1836,22 @@ local toastFrame
 local toastQueue = {}
 local toastBusy = false
 
+local function SoundsAllowed()
+	-- Before DB exists, allow sounds (defaults are on).
+	if type(AJHDB) ~= "table" then
+		return true
+	end
+	if AJHDB.soundsEnabled == false then
+		return false
+	end
+	local vol = ToNumberOr(AJHDB.soundVolume, 100) or 100
+	return vol > 0
+end
+
 local function PlayAchievementSound()
+	if not SoundsAllowed() then
+		return
+	end
 	-- Same fanfare as character level-up.
 	local played = pcall(function()
 		if SOUNDKIT and SOUNDKIT.LEVELUP then
@@ -1956,10 +2000,14 @@ local function AnnounceLevelUp(newLevel)
 end
 
 local function GetAchievementMask()
+	-- Legacy bitmask for older peers. Cap at 31 bits so "%d" / C int paths
+	-- never overflow (location feats alone exceed 32/53-bit masks).
 	EnsureDB()
 	local mask = 0
-	for i, ach in ipairs(ACHIEVEMENTS) do
-		if AJHDB.achievements[ach.id] then
+	local limit = math.min(#ACHIEVEMENTS, 31)
+	for i = 1, limit do
+		local ach = ACHIEVEMENTS[i]
+		if ach and AJHDB.achievements[ach.id] then
 			mask = mask + (2 ^ (i - 1))
 		end
 	end
@@ -1969,7 +2017,8 @@ end
 local function CountAchievementsFromMask(mask)
 	mask = tonumber(mask) or 0
 	local n = 0
-	for i = 1, #ACHIEVEMENTS do
+	local limit = math.min(#ACHIEVEMENTS, 31)
+	for i = 1, limit do
 		local bitv = 2 ^ (i - 1)
 		if math.floor(mask / bitv) % 2 == 1 then
 			n = n + 1
@@ -2005,7 +2054,7 @@ local function UnlockAchievement(ach)
 
 	QueueAchievementToast(ach)
 
-	if IsInGuild() then
+	if AJHDB.autoAnnounce ~= false and IsInGuild() then
 		SendChatMessage(
 			string.format("Jump Habit Feat: %s - %s", ach.name, ach.desc),
 			"GUILD"
@@ -2051,10 +2100,162 @@ local ui = {
 	achRows = {},
 	featCatRows = {},
 	featView = "categories", -- "categories" or a FEAT_CATEGORIES id
+	habitView = "main", -- "main" or "stats"
 }
 local lastGuildReply = 0
 local jumpXPBar
 local JUMP_XP_BAR_HEIGHT = 14
+
+-- Session statistics (not SavedVariables), except playTime / sessionJumpHigh in AJHDB.
+local sessionStartTime = 0
+local sessionJumps = 0
+local lastAcceptedJumpTime = 0
+local JUMP_TIME_RING_SIZE = 200
+local jumpTimeRing = {}
+local jumpTimeRingCount = 0
+local jumpTimeRingNext = 1
+-- Seconds of play already credited into AJHDB.playTime this login.
+local playTimeFlushed = 0
+local playTimeTicker
+-- Attributed active time per accepted jump (matches jump cooldown cadence).
+local JUMP_ACTIVITY_SEC = 0.8
+
+local function EnsureSessionClock()
+	if sessionStartTime <= 0 then
+		sessionStartTime = GetTime()
+	end
+end
+
+local function CurrentSessionElapsed()
+	EnsureSessionClock()
+	return math.max(0, GetTime() - sessionStartTime)
+end
+
+local function FlushPlayTime()
+	EnsureDB()
+	local elapsed = CurrentSessionElapsed()
+	local delta = elapsed - playTimeFlushed
+	if delta > 0 then
+		AJHDB.playTime = (ToNumberOr(AJHDB.playTime, 0) or 0) + delta
+		playTimeFlushed = elapsed
+	end
+end
+
+local function LifetimePlayTime()
+	EnsureDB()
+	FlushPlayTime()
+	return ToNumberOr(AJHDB.playTime, 0) or 0
+end
+
+local function LifetimeJumpActivityTime()
+	EnsureDB()
+	return ToNumberOr(AJHDB.jumpActivityTime, 0) or 0
+end
+
+local function NoteJumpActivity()
+	EnsureDB()
+	FlushPlayTime()
+	AJHDB.jumpActivityTime = (ToNumberOr(AJHDB.jumpActivityTime, 0) or 0) + JUMP_ACTIVITY_SEC
+end
+
+local function FormatJumpIdlePct(jumpSec, totalSec)
+	if not totalSec or totalSec <= 0 then
+		return "—"
+	end
+	local jumpPct = math.min(100, (jumpSec / totalSec) * 100)
+	local idlePct = math.max(0, 100 - jumpPct)
+	return string.format("%.0f%% jumping · %.0f%% idle", jumpPct, idlePct)
+end
+
+local function RecordSessionJump(now)
+	EnsureSessionClock()
+	sessionJumps = sessionJumps + 1
+	lastAcceptedJumpTime = now
+	jumpTimeRing[jumpTimeRingNext] = now
+	jumpTimeRingNext = (jumpTimeRingNext % JUMP_TIME_RING_SIZE) + 1
+	if jumpTimeRingCount < JUMP_TIME_RING_SIZE then
+		jumpTimeRingCount = jumpTimeRingCount + 1
+	end
+end
+
+local function NoteSessionJumpHigh()
+	EnsureDB()
+	local high = AJHDB.sessionJumpHigh or 0
+	if sessionJumps > high then
+		AJHDB.sessionJumpHigh = sessionJumps
+		CommitFloor()
+		PersistProgressMirror()
+	end
+end
+
+local function CountJumpsInWindow(windowSec)
+	local cutoff = GetTime() - windowSec
+	local n = 0
+	for i = 1, jumpTimeRingCount do
+		local t = jumpTimeRing[i]
+		if t and t >= cutoff then
+			n = n + 1
+		end
+	end
+	return n
+end
+
+local function FormatDuration(seconds)
+	seconds = math.max(0, math.floor(seconds or 0))
+	local h = math.floor(seconds / 3600)
+	local m = math.floor((seconds % 3600) / 60)
+	local s = seconds % 60
+	if h > 0 then
+		return string.format("%dh %dm", h, m)
+	elseif m > 0 then
+		return string.format("%dm %ds", m, s)
+	end
+	return string.format("%ds", s)
+end
+
+local statsTicker
+
+local function StopStatsTicker()
+	if statsTicker then
+		statsTicker:Cancel()
+		statsTicker = nil
+	end
+end
+
+local function StartStatsTicker()
+	StopStatsTicker()
+	if not (C_Timer and C_Timer.NewTicker) then
+		return
+	end
+	statsTicker = C_Timer.NewTicker(1, function()
+		if not panel or not panel:IsShown() or activeTab ~= "habit" or ui.habitView ~= "stats" then
+			StopStatsTicker()
+			return
+		end
+		panel:Update()
+	end)
+end
+
+local function SyncStatsTicker()
+	if panel and panel:IsShown() and activeTab == "habit" and ui.habitView == "stats" then
+		if not statsTicker then
+			StartStatsTicker()
+		end
+	else
+		StopStatsTicker()
+	end
+end
+
+local function ShowHabitView(view)
+	ui.habitView = view or "main"
+	if ui.habitMain then
+		ui.habitMain:SetShown(ui.habitView == "main")
+	end
+	if ui.habitStats then
+		ui.habitStats:SetShown(ui.habitView == "stats")
+	end
+	SyncStatsTicker()
+end
 
 local function IsEditModeActive()
 	if LibEditMode and LibEditMode.IsInEditMode then
@@ -2738,7 +2939,7 @@ local function BuildJumpXPBar()
 	return holder
 end
 
-local function StoreScore(key, name, jumps, achMask, xp)
+local function StoreScore(key, name, jumps, achMask, xp, achs)
 	EnsureDB()
 	if type(AJHDB) ~= "table" then
 		return
@@ -2752,6 +2953,11 @@ local function StoreScore(key, name, jumps, achMask, xp)
 		-- Legacy peers only sent jumps; approximate XP from jumps.
 		xpN = jumpsN
 	end
+	local achsN = tonumber(achs)
+	if achsN == nil then
+		-- Legacy: derive a (possibly truncated) count from the bitmask.
+		achsN = CountAchievementsFromMask(achMask)
+	end
 	local prev = AJHDB.board[key]
 	-- Raise-only so a stale broadcast cannot demote a richer row.
 	if type(prev) == "table" then
@@ -2761,11 +2967,15 @@ local function StoreScore(key, name, jumps, achMask, xp)
 		if ToNumberOr(prev.xp, 0) > xpN then
 			xpN = ToNumberOr(prev.xp, 0)
 		end
+		if ToNumberOr(prev.achs, 0) > achsN then
+			achsN = ToNumberOr(prev.achs, 0)
+		end
 	end
 	AJHDB.board[key] = {
 		name = name or (type(prev) == "table" and prev.name) or key,
 		jumps = jumpsN,
 		xp = xpN,
+		achs = achsN,
 		achMask = tonumber(achMask) or (type(prev) == "table" and prev.achMask) or 0,
 		updated = time(),
 	}
@@ -2904,31 +3114,36 @@ BroadcastScore = function()
 		return
 	end
 	local mask = GetAchievementMask()
+	local achs = CountOwnAchievements()
 	local jumps = ToNumberOr(AJHDB.jumps, 0)
 	local xp = ToNumberOr(AJHDB.xp, 0)
-	StoreScore(key, name, jumps, mask, xp)
-	-- One legacy + one extended on GUILD; whispers only send legacy once (throttle).
-	SendGuildAddonMessage(string.format("S:%d:%d", jumps, mask))
-	SendGuildAddonMessage(string.format("X:%d:%d:%d", jumps, mask, xp))
+	StoreScore(key, name, jumps, mask, xp, achs)
+	-- Y: feat count (correct with many feats). X/S: legacy capped 31-bit mask.
+	local yMsg = string.format("Y:%d:%d:%d", jumps, achs, xp)
+	local sMsg = string.format("S:%d:%d", jumps, mask)
+	local xMsg = string.format("X:%d:%d:%d", jumps, mask, xp)
+	SendGuildAddonMessage(yMsg)
+	SendGuildAddonMessage(sMsg)
+	SendGuildAddonMessage(xMsg)
 	local whispered = 0
 	local whisperFail = 0
-	local legacy = string.format("S:%d:%d", jumps, mask)
 	for _, target in ipairs(IterOnlineGuildNames()) do
-		if SendWhisperAddonMessage(legacy, target) then
+		if SendWhisperAddonMessage(yMsg, target) then
 			whispered = whispered + 1
 		else
 			whisperFail = whisperFail + 1
 		end
-		-- Extended XP for peers on this build.
-		SendWhisperAddonMessage(string.format("X:%d:%d:%d", jumps, mask, xp), target)
+		SendWhisperAddonMessage(sMsg, target)
+		SendWhisperAddonMessage(xMsg, target)
 	end
 	-- Also party/raid if grouped with them.
 	if IsInGroup and IsInGroup() then
 		pcall(function()
 			local chatType = (IsInRaid and IsInRaid()) and "RAID" or "PARTY"
 			if C_ChatInfo and C_ChatInfo.SendAddonMessage then
-				C_ChatInfo.SendAddonMessage(ADDON_PREFIX, legacy, chatType)
-				C_ChatInfo.SendAddonMessage(ADDON_PREFIX, string.format("X:%d:%d:%d", jumps, mask, xp), chatType)
+				C_ChatInfo.SendAddonMessage(ADDON_PREFIX, yMsg, chatType)
+				C_ChatInfo.SendAddonMessage(ADDON_PREFIX, sMsg, chatType)
+				C_ChatInfo.SendAddonMessage(ADDON_PREFIX, xMsg, chatType)
 			end
 		end)
 	end
@@ -2979,6 +3194,9 @@ local function CreateScrollArea(parent)
 end
 
 local function PlayUISound(kit, fallback)
+	if not SoundsAllowed() then
+		return
+	end
 	if SOUNDKIT and SOUNDKIT[kit] then
 		PlaySound(SOUNDKIT[kit], "SFX")
 	else
@@ -3018,6 +3236,10 @@ local function SetTab(id, silent)
 	end
 	if panel and ui.tabIndex and ui.tabIndex[id] then
 		PanelTemplates_SetTab(panel, ui.tabIndex[id])
+	end
+	if id == "habit" then
+		-- Leaving Habit and returning should always land on Habit main.
+		ShowHabitView("main")
 	end
 	if id == "guild" then
 		RequestGuildScores()
@@ -3138,12 +3360,15 @@ UpdateLeaderboard = function()
 		return
 	end
 	local key, name = PlayerIdentity()
-	StoreScore(key, name, AJHDB.jumps, GetAchievementMask(), AJHDB.xp)
+	StoreScore(key, name, AJHDB.jumps, GetAchievementMask(), AJHDB.xp, CountOwnAchievements())
 
 	local entries = {}
 	for entryKey, data in pairs(AJHDB.board) do
 		if type(data) == "table" and type(data.jumps) == "number" then
-			local achCount = CountAchievementsFromMask(data.achMask)
+			local achCount = ToNumberOr(data.achs, nil)
+			if achCount == nil then
+				achCount = CountAchievementsFromMask(data.achMask)
+			end
 			if entryKey == key then
 				achCount = CountOwnAchievements()
 			end
@@ -3503,13 +3728,14 @@ local function BuildPanel()
 		{ id = "levels", label = "Levels" },
 		{ id = "achieves", label = "Feats" },
 		{ id = "guild", label = "Guild" },
+		{ id = "settings", label = "", iconOnly = true },
 	}
 	ui.tabIndex = {}
 	ui.tabButtons = {}
 	for i, def in ipairs(tabDefs) do
 		local tab = CreateFrame("Button", "AJHFrameTab" .. i, panel, "PanelTabButtonTemplate")
 		tab:SetID(i)
-		tab:SetText(def.label)
+		tab:SetText(def.label or "")
 		tab.tabId = def.id
 		if i == 1 then
 			tab:SetPoint("TOPLEFT", panel, "BOTTOMLEFT", 11, 2)
@@ -3519,7 +3745,30 @@ local function BuildPanel()
 		tab:SetScript("OnClick", function(self)
 			SetTab(self.tabId)
 		end)
-		if PanelTemplates_TabResize then
+		if def.iconOnly then
+			-- Compact gear tab (no text label).
+			local icon = tab:CreateTexture(nil, "ARTWORK")
+			icon:SetTexture("Interface\\Buttons\\UI-OptionsButton")
+			icon:SetSize(14, 14)
+			icon:SetPoint("CENTER", 0, -1)
+			tab.settingsIcon = icon
+			if tab.Text then
+				tab.Text:SetText("")
+				tab.Text:Hide()
+			end
+			tab:SetWidth(32)
+			if PanelTemplates_TabResize then
+				PanelTemplates_TabResize(tab, -18)
+			end
+			tab:SetScript("OnEnter", function(self)
+				GameTooltip:SetOwner(self, "ANCHOR_TOP")
+				GameTooltip:SetText("Settings")
+				GameTooltip:Show()
+			end)
+			tab:SetScript("OnLeave", function()
+				GameTooltip:Hide()
+			end)
+		elseif PanelTemplates_TabResize then
 			PanelTemplates_TabResize(tab, 0)
 		end
 		ui.tabButtons[i] = tab
@@ -3529,17 +3778,33 @@ local function BuildPanel()
 	PanelTemplates_SetNumTabs(panel, #tabDefs)
 	PanelTemplates_SetTab(panel, 1)
 
-	-- Habit page
+	-- Habit page (main + nested Statistics)
 	local habit = CreateFrame("Frame", nil, content)
 	habit:SetAllPoints()
 	ui.pages.habit = habit
 
-	local levelLabel = habit:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	local habitMain = CreateFrame("Frame", nil, habit)
+	habitMain:SetAllPoints()
+	ui.habitMain = habitMain
+
+	local statsBtn = CreateFrame("Button", nil, habitMain, "UIPanelButtonTemplate")
+	statsBtn:SetSize(88, 20)
+	statsBtn:SetPoint("TOPRIGHT", -6, -6)
+	statsBtn:SetText("Statistics")
+	statsBtn:SetScript("OnClick", function()
+		ShowHabitView("stats")
+		if panel then
+			panel:Update()
+		end
+	end)
+	ui.habitStatsBtn = statsBtn
+
+	local levelLabel = habitMain:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	levelLabel:SetPoint("TOP", 0, -8)
 	levelLabel:SetText("LEVEL")
 	levelLabel:SetTextColor(1, 0.82, 0)
 
-	ui.level = habit:CreateFontString(nil, "OVERLAY", "GameFontNormalHuge")
+	ui.level = habitMain:CreateFontString(nil, "OVERLAY", "GameFontNormalHuge")
 	ui.level:SetPoint("TOP", levelLabel, "BOTTOM", 0, -2)
 	-- Large gold level number.
 	local levelFont = (STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF")
@@ -3552,11 +3817,11 @@ local function BuildPanel()
 
 	-- Habit XP bar: flat yellow fill flush to the frame (no texture padding gaps).
 	local BAR_PAD = 22
-	local barWrap = CreateFrame("Frame", nil, habit)
+	local barWrap = CreateFrame("Frame", nil, habitMain)
 	barWrap:ClearAllPoints()
 	barWrap:SetPoint("TOP", ui.level, "BOTTOM", 0, -14)
-	barWrap:SetPoint("LEFT", habit, "LEFT", BAR_PAD, 0)
-	barWrap:SetPoint("RIGHT", habit, "RIGHT", -BAR_PAD, 0)
+	barWrap:SetPoint("LEFT", habitMain, "LEFT", BAR_PAD, 0)
+	barWrap:SetPoint("RIGHT", habitMain, "RIGHT", -BAR_PAD, 0)
 	barWrap:SetHeight(22)
 	ui.barWrap = barWrap
 
@@ -3661,40 +3926,40 @@ local function BuildPanel()
 		ui.barText:SetShadowColor(0, 0, 0, 0)
 	end
 
-	ui.xpDetail = habit:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	ui.xpDetail = habitMain:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	ui.xpDetail:SetPoint("TOP", barWrap, "BOTTOM", 0, -10)
 	ui.xpDetail:SetTextColor(1, 0.82, 0)
 
-	local statsLine = habit:CreateTexture(nil, "ARTWORK")
+	local statsLine = habitMain:CreateTexture(nil, "ARTWORK")
 	statsLine:SetHeight(1)
 	statsLine:SetColorTexture(0.55, 0.45, 0.15, 0.55)
-	statsLine:SetPoint("LEFT", habit, "LEFT", 16, 0)
-	statsLine:SetPoint("RIGHT", habit, "RIGHT", -16, 0)
+	statsLine:SetPoint("LEFT", habitMain, "LEFT", 16, 0)
+	statsLine:SetPoint("RIGHT", habitMain, "RIGHT", -16, 0)
 	statsLine:SetPoint("TOP", ui.xpDetail, "BOTTOM", 0, -12)
 
-	local function HabitStatRow(anchor, yOff)
-		local label = habit:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	local function HabitStatRow(parent, anchor, yOff)
+		local label = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 		label:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, yOff)
-		local value = habit:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		local value = parent:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
 		value:SetPoint("TOPRIGHT", anchor, "BOTTOMRIGHT", 0, yOff)
 		return label, value
 	end
 
-	ui.jumpLabel, ui.jumpValue = HabitStatRow(statsLine, -14)
+	ui.jumpLabel, ui.jumpValue = HabitStatRow(habitMain, statsLine, -14)
 	ui.jumpLabel:SetText("Total jumps")
 
-	ui.xpLabel, ui.xpValue = HabitStatRow(ui.jumpLabel, -10)
+	ui.xpLabel, ui.xpValue = HabitStatRow(habitMain, ui.jumpLabel, -10)
 	ui.xpLabel:SetText("Experience")
 	-- Keep value aligned to the full-width line, not the shorter label.
 	ui.xpValue:ClearAllPoints()
 	ui.xpValue:SetPoint("TOPRIGHT", ui.jumpValue, "BOTTOMRIGHT", 0, -10)
 
-	ui.nextLabel, ui.nextValue = HabitStatRow(ui.xpLabel, -10)
+	ui.nextLabel, ui.nextValue = HabitStatRow(habitMain, ui.xpLabel, -10)
 	ui.nextLabel:SetText("XP to next level")
 	ui.nextValue:ClearAllPoints()
 	ui.nextValue:SetPoint("TOPRIGHT", ui.xpValue, "BOTTOMRIGHT", 0, -10)
 
-	ui.rateLabel, ui.rateValue = HabitStatRow(ui.nextLabel, -10)
+	ui.rateLabel, ui.rateValue = HabitStatRow(habitMain, ui.nextLabel, -10)
 	ui.rateLabel:SetText("XP per jump")
 	ui.rateValue:ClearAllPoints()
 	ui.rateValue:SetPoint("TOPRIGHT", ui.nextValue, "BOTTOMRIGHT", 0, -10)
@@ -3725,7 +3990,7 @@ local function BuildPanel()
 	-- One tidy row of three equal buttons.
 	local BTN_PAD = 12
 	local BTN_GAP = 6
-	local btnRow = CreateFrame("Frame", nil, habit)
+	local btnRow = CreateFrame("Frame", nil, habitMain)
 	btnRow:SetPoint("BOTTOMLEFT", BTN_PAD, 10)
 	btnRow:SetPoint("BOTTOMRIGHT", -BTN_PAD, 10)
 	btnRow:SetHeight(22)
@@ -3772,6 +4037,64 @@ local function BuildPanel()
 		AnnounceStatus("GUILD")
 	end)
 	UpdateJumpXPBarToggleLabel()
+
+	-- Habit Statistics subview
+	local habitStats = CreateFrame("Frame", nil, habit)
+	habitStats:SetAllPoints()
+	habitStats:Hide()
+	ui.habitStats = habitStats
+
+	local backBtn = CreateFrame("Button", nil, habitStats, "UIPanelButtonTemplate")
+	backBtn:SetSize(60, 20)
+	backBtn:SetPoint("TOPLEFT", 6, -6)
+	backBtn:SetText("Back")
+	backBtn:SetScript("OnClick", function()
+		ShowHabitView("main")
+		if panel then
+			panel:Update()
+		end
+	end)
+	ui.habitStatsBack = backBtn
+
+	local statsTitle = habitStats:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	statsTitle:SetPoint("TOP", 0, -8)
+	statsTitle:SetText("Statistics")
+	statsTitle:SetTextColor(1, 0.82, 0)
+
+	local statsDivider = habitStats:CreateTexture(nil, "ARTWORK")
+	statsDivider:SetHeight(1)
+	statsDivider:SetColorTexture(0.55, 0.45, 0.15, 0.55)
+	statsDivider:SetPoint("LEFT", habitStats, "LEFT", 16, 0)
+	statsDivider:SetPoint("RIGHT", habitStats, "RIGHT", -16, 0)
+	statsDivider:SetPoint("TOP", statsTitle, "BOTTOM", 0, -10)
+
+	local prevStatValue = nil
+	local function StatsRow(anchor, yOff, labelText)
+		local label, value = HabitStatRow(habitStats, anchor, yOff)
+		label:SetText(labelText)
+		value:ClearAllPoints()
+		if prevStatValue then
+			value:SetPoint("TOPRIGHT", prevStatValue, "BOTTOMRIGHT", 0, yOff)
+		else
+			value:SetPoint("TOPRIGHT", anchor, "BOTTOMRIGHT", 0, yOff)
+		end
+		prevStatValue = value
+		return label, value
+	end
+
+	ui.statSessionJumpsLabel, ui.statSessionJumps = StatsRow(statsDivider, -14, "Session jumps")
+	ui.statSessionHighLabel, ui.statSessionHigh = StatsRow(ui.statSessionJumpsLabel, -10, "Best session")
+	ui.statSessionTimeLabel, ui.statSessionTime = StatsRow(ui.statSessionHighLabel, -10, "Session time")
+	ui.statSessionActivityLabel, ui.statSessionActivity = StatsRow(ui.statSessionTimeLabel, -10, "Session activity")
+	ui.statSessionRateLabel, ui.statSessionRate = StatsRow(ui.statSessionActivityLabel, -10, "Session rate")
+	ui.statRecentRateLabel, ui.statRecentRate = StatsRow(ui.statSessionRateLabel, -10, "Recent rate (5m)")
+	ui.statLifeJumpsLabel, ui.statLifeJumps = StatsRow(ui.statRecentRateLabel, -10, "Lifetime jumps")
+	ui.statLifeLevelLabel, ui.statLifeLevel = StatsRow(ui.statLifeJumpsLabel, -10, "Lifetime level")
+	ui.statLifeActivityLabel, ui.statLifeActivity = StatsRow(ui.statLifeLevelLabel, -10, "Lifetime activity")
+	ui.statFeatsLabel, ui.statFeats = StatsRow(ui.statLifeActivityLabel, -10, "Feats unlocked")
+	ui.statLastJumpLabel, ui.statLastJump = StatsRow(ui.statFeatsLabel, -10, "Time since last jump")
+
+	ShowHabitView("main")
 
 	-- Levels page
 	local levels = CreateFrame("Frame", nil, content)
@@ -3867,16 +4190,124 @@ local function BuildPanel()
 	boardWrap:SetPoint("TOPLEFT", 4, -4)
 	boardWrap:SetPoint("BOTTOMRIGHT", -4, 32)
 
+	-- Settings page (sound enable + volume)
+	local settings = CreateFrame("Frame", nil, content)
+	settings:SetAllPoints()
+	settings:Hide()
+	ui.pages.settings = settings
+
+	local settingsTitle = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	settingsTitle:SetPoint("TOP", 0, -12)
+	settingsTitle:SetText("Settings")
+	settingsTitle:SetTextColor(1, 0.82, 0)
+
+	local soundCheck = CreateFrame("CheckButton", nil, settings, "UICheckButtonTemplate")
+	soundCheck:SetPoint("TOPLEFT", 20, -48)
+	soundCheck:SetSize(26, 26)
+	local soundCheckLabel = settings:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	soundCheckLabel:SetPoint("LEFT", soundCheck, "RIGHT", 4, 1)
+	soundCheckLabel:SetText("Enable sounds")
+	soundCheck:SetScript("OnClick", function(self)
+		EnsureDB()
+		AJHDB.soundsEnabled = not not self:GetChecked()
+	end)
+	ui.soundCheck = soundCheck
+
+	local announceCheck = CreateFrame("CheckButton", nil, settings, "UICheckButtonTemplate")
+	announceCheck:SetPoint("TOPLEFT", soundCheck, "BOTTOMLEFT", 0, -6)
+	announceCheck:SetSize(26, 26)
+	local announceCheckLabel = settings:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	announceCheckLabel:SetPoint("LEFT", announceCheck, "RIGHT", 4, 1)
+	announceCheckLabel:SetText("Auto announce feats to guild")
+	announceCheck:SetScript("OnClick", function(self)
+		EnsureDB()
+		AJHDB.autoAnnounce = not not self:GetChecked()
+	end)
+	ui.announceCheck = announceCheck
+
+	local volumeLabel = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	volumeLabel:SetPoint("TOPLEFT", 24, -128)
+	volumeLabel:SetText("Sound volume")
+	ui.soundVolumeLabel = volumeLabel
+
+	local volumeValue = settings:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	volumeValue:SetPoint("LEFT", volumeLabel, "RIGHT", 8, 0)
+	ui.soundVolumeValue = volumeValue
+
+	local volumeSlider
+	local sliderOk = pcall(function()
+		volumeSlider = CreateFrame("Slider", "AJHSoundVolumeSlider", settings, "OptionsSliderTemplate")
+	end)
+	if not sliderOk or not volumeSlider then
+		volumeSlider = CreateFrame("Slider", "AJHSoundVolumeSlider", settings)
+		volumeSlider:SetOrientation("HORIZONTAL")
+		volumeSlider:SetHitRectInsets(0, 0, -10, -10)
+		local thumb = volumeSlider:CreateTexture(nil, "OVERLAY")
+		thumb:SetTexture("Interface\\Buttons\\UI-SliderBar-Button-Horizontal")
+		thumb:SetSize(24, 32)
+		volumeSlider:SetThumbTexture(thumb)
+		local bg = volumeSlider:CreateTexture(nil, "BACKGROUND")
+		bg:SetTexture("Interface\\Buttons\\UI-SliderBar-Background")
+		bg:SetPoint("TOPLEFT", 0, 0)
+		bg:SetPoint("BOTTOMRIGHT", 0, 0)
+	end
+	volumeSlider:SetPoint("TOPLEFT", 28, -160)
+	volumeSlider:SetPoint("TOPRIGHT", -28, -160)
+	volumeSlider:SetHeight(16)
+	volumeSlider:SetMinMaxValues(0, 100)
+	volumeSlider:SetValueStep(1)
+	if volumeSlider.SetObeyStepOnDrag then
+		volumeSlider:SetObeyStepOnDrag(true)
+	end
+	volumeSlider:SetScript("OnValueChanged", function(self, value)
+		EnsureDB()
+		value = math.floor(value + 0.5)
+		AJHDB.soundVolume = value
+		if ui.soundVolumeValue then
+			ui.soundVolumeValue:SetText(tostring(value))
+		end
+		local text = _G[self:GetName() .. "Text"]
+		if text then
+			text:SetText("Sound volume")
+		end
+	end)
+	do
+		local low = _G[volumeSlider:GetName() .. "Low"]
+		local high = _G[volumeSlider:GetName() .. "High"]
+		local text = _G[volumeSlider:GetName() .. "Text"]
+		if low then
+			low:SetText("0")
+		end
+		if high then
+			high:SetText("100")
+		end
+		if text then
+			text:SetText("Sound volume")
+		end
+	end
+	ui.soundVolumeSlider = volumeSlider
+
+	local volumeNote = settings:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	volumeNote:SetPoint("TOPLEFT", 24, -200)
+	volumeNote:SetPoint("TOPRIGHT", -24, -200)
+	volumeNote:SetJustifyH("LEFT")
+	volumeNote:SetText("Volume 0 mutes AJH sounds. Manual Announce buttons on Habit are unchanged.")
+	volumeNote:SetTextColor(0.7, 0.7, 0.7)
+
 	panel:SetScript("OnShow", function()
 		PlayUISound("IG_CHARACTER_INFO_OPEN", 839)
 		panel:Update()
+		SyncStatsTicker()
 	end)
 	panel:SetScript("OnHide", function()
 		PlayUISound("IG_CHARACTER_INFO_CLOSE", 840)
+		StopStatsTicker()
 	end)
 
 	function panel:Update()
 		EnsureDB()
+		EnsureSessionClock()
+		FlushPlayTime()
 		local xp = AJHDB.xp
 		local jumps = AJHDB.jumps
 		local level = GetLevel(xp)
@@ -3926,6 +4357,61 @@ local function BuildPanel()
 			ui.xpValue:SetText(FormatNumber(intoLevel))
 			ui.nextLabel:SetText("XP to next level")
 			ui.nextValue:SetText(FormatNumber(remaining))
+		end
+
+		if activeTab == "habit" and ui.habitView == "stats" and ui.statSessionJumps then
+			local now = GetTime()
+			local elapsed = math.max(1, CurrentSessionElapsed())
+			local perMin = sessionJumps * 60 / elapsed
+			local perHr = sessionJumps * 3600 / elapsed
+			local recent = CountJumpsInWindow(300)
+			local recentPerMin = recent / 5
+			local best = AJHDB.sessionJumpHigh or 0
+			if sessionJumps > best then
+				best = sessionJumps
+			end
+			local featEarned = CountOwnAchievements()
+			local featTotal = #ACHIEVEMENTS
+			local lifePlay = LifetimePlayTime()
+			local sessionJumpSec = sessionJumps * JUMP_ACTIVITY_SEC
+			local lifeJumpSec = LifetimeJumpActivityTime()
+
+			if best > 0 then
+				local pctOfBest = math.floor((sessionJumps / best) * 100 + 0.5)
+				ui.statSessionJumps:SetText(string.format("%s (%d%%)", FormatNumber(sessionJumps), pctOfBest))
+				ui.statSessionHigh:SetText(FormatNumber(best))
+			else
+				ui.statSessionJumps:SetText(FormatNumber(sessionJumps))
+				ui.statSessionHigh:SetText("—")
+			end
+			ui.statSessionTime:SetText(FormatDuration(elapsed))
+			ui.statSessionActivity:SetText(FormatJumpIdlePct(sessionJumpSec, elapsed))
+			ui.statSessionRate:SetText(string.format("%.1f/min  ·  %.0f/hr", perMin, perHr))
+			ui.statRecentRate:SetText(string.format("%.1f/min", recentPerMin))
+			ui.statLifeJumps:SetText(FormatNumber(jumps))
+			ui.statLifeLevel:SetText(tostring(level))
+			ui.statLifeActivity:SetText(FormatJumpIdlePct(lifeJumpSec, lifePlay))
+			if featTotal > 0 then
+				local featPct = math.floor((featEarned / featTotal) * 100 + 0.5)
+				ui.statFeats:SetText(string.format("%d / %d (%d%%)", featEarned, featTotal, featPct))
+			else
+				ui.statFeats:SetText(string.format("%d / %d", featEarned, featTotal))
+			end
+			if lastAcceptedJumpTime > 0 then
+				ui.statLastJump:SetText(FormatDuration(now - lastAcceptedJumpTime))
+			else
+				ui.statLastJump:SetText("—")
+			end
+		end
+
+		if activeTab == "settings" and ui.soundCheck then
+			ui.soundCheck:SetChecked(AJHDB.soundsEnabled ~= false)
+			if ui.announceCheck then
+				ui.announceCheck:SetChecked(AJHDB.autoAnnounce ~= false)
+			end
+			local vol = ToNumberOr(AJHDB.soundVolume, 100) or 100
+			ui.soundVolumeSlider:SetValue(vol)
+			ui.soundVolumeValue:SetText(tostring(math.floor(vol + 0.5)))
 		end
 
 		if activeTab == "guild" then
@@ -4044,7 +4530,7 @@ local function BuildMinimapButton()
 	return btn
 end
 
-local JUMP_COOLDOWN = 0.8
+local JUMP_COOLDOWN = JUMP_ACTIVITY_SEC
 local lastJumpTime = 0
 
 local function StartLateLoadWatch()
@@ -4085,8 +4571,11 @@ local function OnJump()
 		return
 	end
 	lastJumpTime = now
+	RecordSessionJump(now)
 
 	EnsureDB()
+	NoteSessionJumpHigh()
+	NoteJumpActivity()
 	local oldLevel = GetLevel(AJHDB.xp)
 	AJHDB.jumps = AJHDB.jumps + 1
 	AJHDB.xp = AJHDB.xp + GetJumpXPGain()
@@ -4120,6 +4609,7 @@ local function EnsureUIBuilt()
 		return
 	end
 	uiBuilt = true
+	EnsureSessionClock()
 	BuildPanel()
 	BuildJumpXPBar()
 	BuildMinimapButton()
@@ -4128,6 +4618,14 @@ local function EnsureUIBuilt()
 		hooksecurefunc("JumpOrAscendStart", OnJump)
 	end
 	RefreshCampBenefit()
+	-- Keep lifetime play time moving even when the panel is closed.
+	if C_Timer and C_Timer.NewTicker and not playTimeTicker then
+		playTimeTicker = C_Timer.NewTicker(5, function()
+			if type(AJHDB) == "table" then
+				FlushPlayTime()
+			end
+		end)
+	end
 end
 
 local loader = CreateFrame("Frame")
@@ -4227,6 +4725,7 @@ loader:SetScript("OnEvent", function(self, event, ...)
 			or (type(AJHDB) == "table" and ToNumberOr(AJHDB.jumps, 0) > 0)
 		if type(AJHAccount) == "table" and hasProgress then
 			EnsureDB()
+			FlushPlayTime()
 			if type(AJHDB) == "table" and ToNumberOr(AJHDB.jumps, 0) > 0 then
 				CommitFloor()
 			end
@@ -4304,19 +4803,29 @@ loader:SetScript("OnEvent", function(self, event, ...)
 				BroadcastScore()
 			end
 		else
-			-- X:jumps:achMask:xp (new) or S:jumps:achMask / S:jumps (legacy)
-			local jumps, achMask, xp = message:match("^X:(%d+):(%d+):(%d+)$")
-			if not jumps then
-				jumps, achMask = message:match("^S:(%d+):(%d+)$")
-				xp = nil
-			end
-			if not jumps then
-				jumps = message:match("^S:(%d+)$")
+			-- Y:jumps:achs:xp (feat count) — preferred with many location feats.
+			-- X:jumps:achMask:xp / S:jumps:achMask — legacy bitmask (capped).
+			local jumps, achs, achMask, xp
+			jumps, achs, xp = message:match("^Y:(%d+):(%d+):(%d+)$")
+			if jumps then
+				achs = tonumber(achs) or 0
 				achMask = 0
-				xp = nil
-			end
-			if not jumps then
-				jumps, achMask, xp = message:match("^S:(%d+):(%d+):(%d+)$")
+				xp = tonumber(xp)
+			else
+				jumps, achMask, xp = message:match("^X:(%d+):(%d+):(%d+)$")
+				if not jumps then
+					jumps, achMask = message:match("^S:(%d+):(%d+)$")
+					xp = nil
+				end
+				if not jumps then
+					jumps = message:match("^S:(%d+)$")
+					achMask = 0
+					xp = nil
+				end
+				if not jumps then
+					jumps, achMask, xp = message:match("^S:(%d+):(%d+):(%d+)$")
+				end
+				achs = nil
 			end
 			jumps = tonumber(jumps)
 			achMask = tonumber(achMask) or 0
@@ -4333,7 +4842,7 @@ loader:SetScript("OnEvent", function(self, event, ...)
 			elseif myKey and boardKey == myKey then
 				boardKey = myKey
 			end
-			StoreScore(boardKey, short, jumps, achMask, xp)
+			StoreScore(boardKey, short, jumps, achMask, xp, achs)
 			if DEFAULT_CHAT_FRAME and (DEV_TOOLS or (panel and panel:IsShown() and activeTab == "guild")) then
 				-- One-line confirm when guild tab is open so we can see arrivals.
 				if DEV_TOOLS then

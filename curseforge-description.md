@@ -16,10 +16,11 @@ Made for **World of Warcraft: Forever**.
 - **0.8s jump cooldown** so space-spam and blocked jumps don't farm XP
 
 ### Panel (`/jumphabit` or `/ajh`)
-- **Habit** — level, XP bar, jumps, experience, announce buttons
+- **Habit** — level, XP bar, jumps, experience, announce buttons; **Statistics** subview (session/lifetime rates, best session, jumping vs idle %)
 - **Levels** — full 1-99 XP table (your level highlighted)
 - **Feats** — City / Town / dungeon / raid location feats with category browsing
 - **Guild** — shared leaderboard (jumps + feat count)
+- **Settings** — sounds on/off + volume, auto announce feats to guild
 
 ### Feats
 Earn feats for jumping in places like **Brill**, **Undercity**, other towns and cities, dungeons, and raids.
@@ -45,14 +46,14 @@ Completing a feat plays a toast with fanfare and a line from Archindula. Level-u
 ## Install
 
 1. Download and unzip
-2. Place the `AJH` folder in:
+2. Place the `AJH` and `AJHStore` folders in:
 
    `World of Warcraft\_classic_beta_\Interface\AddOns\`
 
-3. Restart the client or `/reload`
-4. Enable the addon at character select if needed
+3. Enable **both** Archindula's Jump Habit and **AJH Store** at character select
+4. Restart the client or `/reload`
 
-**Note:** Guild leaderboard and feat sync require guildmates to also have AJH installed (and online to refresh scores).
+**Note:** Guild leaderboard and feat sync require guildmates to also have AJH installed (and online to refresh scores). Forever players should keep AJH Store enabled so progress survives SV load misses.
 
 ## Feedback
 
