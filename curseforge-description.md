@@ -16,14 +16,14 @@ Made for **World of Warcraft: Forever**.
 - **0.8s jump cooldown** so space-spam and blocked jumps don't farm XP
 
 ### Panel (`/jumphabit` or `/ajh`)
-- **Habit** — level, XP bar, jumps, experience, announce buttons; **Statistics** subview (session/lifetime rates, best session, jumping vs idle %)
-- **Levels** — full 1-99 XP table (your level highlighted)
-- **Feats** — City / Town / dungeon / raid location feats with category browsing
+- **Habit** — level, XP bar, jumps, experience, announce buttons
+- **Stats** — session/lifetime rates, best session, jumping vs idle %; **Levels** button for the 1-99 XP table
+- **Feats** — City / Town / Hostile / dungeon / raid hubs, plus habit milestones, style, travel, social, collections, oddities
 - **Guild** — shared leaderboard (jumps + feat count)
 - **Settings** — sounds on/off + volume, auto announce feats to guild
 
 ### Feats
-Earn feats for jumping in places like **Brill**, **Undercity**, other towns and cities, dungeons, and raids.
+Earn feats for jumping in places like **Brill**, **The Sepulcher**, **Undercity**, other towns and cities, enemy territory, dungeons, and raids. Opposite-faction hubs show under **Hostile Territory**.
 
 Completing a feat plays a toast with fanfare and a line from Archindula. Level-ups use the same toast style.
 
@@ -34,26 +34,29 @@ Completing a feat plays a toast with fanfare and a line from Archindula. Level-u
 
 ### Quality of life
 - Minimap button (drag to move)
-- Per-character saved progress
+- Account SavedVariables progress
 - Esc to close the panel
 
 ## Commands
 
 - `/jumphabit` or `/ajh` — open the panel
+- `/ajh say` / `/ajh party` / `/ajh guild` — announce level and jumps
+- `/ajh sync` — refresh guild leaderboard
 - `/ajh clear` — reset jumps and XP
 - `/ajh where` — debug current zone names
+- `/ajh help` — list commands
 
 ## Install
 
 1. Download and unzip
-2. Place the `AJH` and `AJHStore` folders in:
+2. Place the `AJH` folder in:
 
    `World of Warcraft\_classic_beta_\Interface\AddOns\`
 
-3. Enable **both** Archindula's Jump Habit and **AJH Store** at character select
+3. Enable **Archindula's Jump Habit** at character select
 4. Restart the client or `/reload`
 
-**Note:** Guild leaderboard and feat sync require guildmates to also have AJH installed (and online to refresh scores). Forever players should keep AJH Store enabled so progress survives SV load misses.
+**Note:** Guild leaderboard and feat sync require guildmates to also have AJH installed (and online to refresh scores).
 
 ## Feedback
 

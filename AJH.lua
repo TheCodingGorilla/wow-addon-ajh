@@ -1,8 +1,15 @@
-﻿local ADDON_NAME, ns = ...
-local LibEditMode = ns and ns.LibEditMode
+local ADDON_NAME, ns = ...
+-- TOC loads AJH.lua before LibEditMode embed; resolve lazily after the lib fills ns.
+function ns.GetLibEditMode()
+	local lem = ns and ns.LibEditMode
+	if lem and lem.AddFrame then
+		return lem
+	end
+	return nil
+end
 
--- Keybind display names. Bindings.xml is auto-loaded by filename — do NOT
--- list it in the TOC (that parses it as UI XML → "Unrecognized XML: Binding").
+-- Keybind display names. Bindings.xml is auto-loaded by filename ? do NOT
+-- list it in the TOC (that parses it as UI XML ? "Unrecognized XML: Binding").
 BINDING_HEADER_AJH = "Archindula's Jump Habit"
 BINDING_NAME_AJH_TOGGLE = "Toggle Archindula's Jump Habit"
 
@@ -12,6 +19,13 @@ local CAMP_XP_MULTIPLIER = 2
 local ADDON_PREFIX = "AJH"
 local ROW_HEIGHT = 22
 local FROG_ICON = "Interface\\Icons\\Spell_Shaman_Hex"
+-- Retail achievements vibe: classic yellow achievement badge for the Feats tab portrait.
+local FEATS_ICON = "Interface\\Icons\\Achievement_General"
+
+-- Session jump counter (declared early so feat tests can close over it).
+local sessionJumps = 0
+local lastAcceptedJumpTime = 0
+local sessionStartTime = 0
 
 -- Local testing only. Enabled when Interface/AddOns/AJH/AJH_Dev exists
 -- (gitignored; never shipped in the CurseForge zip). Not listed in the TOC.
@@ -59,7 +73,7 @@ do
 	end
 end
 
-local function ToNumberOr(value, fallback)
+function ns.ToNumberOr(value, fallback)
 	local n = tonumber(value)
 	if n then
 		return n
@@ -69,7 +83,7 @@ end
 
 -- Layout quality for raise-only merges. Visibility (shown) is intentionally
 -- excluded so hiding the bar cannot be blocked as a "demotion".
-local function JumpXPBarLayoutScore(bar)
+function ns.JumpXPBarLayoutScore(bar)
 	if type(bar) ~= "table" then
 		return -1
 	end
@@ -77,31 +91,31 @@ local function JumpXPBarLayoutScore(bar)
 	if bar.userPlaced then
 		score = score + 100
 	end
-	local widthPct = ToNumberOr(bar.widthPct, 100)
+	local widthPct = ns.ToNumberOr(bar.widthPct, 100)
 	if widthPct ~= 100 then
 		score = score + 5
 	end
 	if type(bar.point) == "string" and bar.point ~= "BOTTOM" then
 		score = score + 5
 	end
-	if ToNumberOr(bar.x, 0) ~= 0 or ToNumberOr(bar.y, 55) ~= 55 then
+	if ns.ToNumberOr(bar.x, 0) ~= 0 or ns.ToNumberOr(bar.y, 55) ~= 55 then
 		score = score + 3
 	end
 	return score
 end
 
-local function JumpXPBarScore(bar)
+function ns.JumpXPBarScore(bar)
 	if type(bar) ~= "table" then
 		return -1
 	end
-	local score = JumpXPBarLayoutScore(bar)
+	local score = ns.JumpXPBarLayoutScore(bar)
 	if bar.shown then
 		score = score + 10
 	end
 	return score
 end
 
-local function CopyJumpXPBarTable(src)
+function ns.CopyJumpXPBarTable(src)
 	if type(src) ~= "table" then
 		return nil
 	end
@@ -115,67 +129,22 @@ local function CopyJumpXPBarTable(src)
 	}
 end
 
-local function PreferJumpXPBar(destBar, srcBar)
-	if JumpXPBarLayoutScore(srcBar) > JumpXPBarLayoutScore(destBar) then
-		return CopyJumpXPBarTable(srcBar)
+function ns.PreferJumpXPBar(destBar, srcBar)
+	if ns.JumpXPBarLayoutScore(srcBar) > ns.JumpXPBarLayoutScore(destBar) then
+		return ns.CopyJumpXPBarTable(srcBar)
 	end
 	-- Same layout quality: still prefer a copy that is shown / has shown flag
 	-- only when dest has no bar at all.
 	if type(destBar) ~= "table" and type(srcBar) == "table" then
-		return CopyJumpXPBarTable(srcBar)
+		return ns.CopyJumpXPBarTable(srcBar)
 	end
 	return nil
 end
 
--- Progress lives ONLY in SavedVariables: AJHAccount (SpaceToAccept pattern).
--- Forever: one account SV in WTF/.../SavedVariables/AJH.lua. Do NOT declare
--- AJHFloor or per-character AJHDB in the TOC — multi/per-char SV has been
--- observed to leave ALL AJH globals nil for the whole session.
--- Never write progress into Interface/AddOns. Never ship HighWater files.
---
--- Forever sometimes leaves SV globals empty at ADDON_LOADED even when WTF
--- files are correct. Mitigations:
--- - Canonical progress in account SV (AJHAccount), shared by name+guid aliases.
--- - Always bind to the richest existing copy; never invent an empty row and
---   overwrite a richer name/guid alias.
--- - Raise-only watermarks: AJHFloor.__best and AJHAccount.__floor.
--- - Blank session must not clobber account/floor stores with zeros.
--- - Full identity bind waits until PLAYER_LOGIN (name+guid are ready).
-
-local function MaxProgressInAccountSV()
-	local maxJ = 0
-	if type(AJHAccount) == "table" then
-		for k, rec in pairs(AJHAccount) do
-			if type(rec) == "table" then
-				local j = ToNumberOr(rec.jumps, 0)
-				if j > maxJ then
-					maxJ = j
-				end
-			end
-		end
-	end
-	if type(AJHFloor) == "table" then
-		for _, rec in pairs(AJHFloor) do
-			if type(rec) == "table" then
-				local j = ToNumberOr(rec.jumps, 0)
-				if j > maxJ then
-					maxJ = j
-				end
-			end
-		end
-	end
-	if type(AJHDB) == "table" then
-		local j = ToNumberOr(AJHDB.jumps, 0)
-		if j > maxJ then
-			maxJ = j
-		end
-	end
-	return maxJ
-end
-
-local lateLoadTicker = nil
-
-local function PlayerKey()
+-- Progress lives in account SavedVariable AJHSaved (see TOC).
+-- Mutate the loaded table. Client saves on logout /reload.
+-- Never invent AJHSaved = {} when the client failed to load it ? that empties the WTF file.
+function ns.PlayerKey()
 	local guid = UnitGUID("player")
 	if type(guid) == "string" and guid ~= "" then
 		return guid
@@ -187,12 +156,12 @@ local function PlayerKey()
 	return nil
 end
 
-local function RaiseNumber(dest, key, srcValue)
-	local incoming = ToNumberOr(srcValue, nil)
+function ns.RaiseNumber(dest, key, srcValue)
+	local incoming = ns.ToNumberOr(srcValue, nil)
 	if type(incoming) ~= "number" then
 		return false
 	end
-	local current = ToNumberOr(dest[key], 0)
+	local current = ns.ToNumberOr(dest[key], 0)
 	if incoming > current then
 		dest[key] = incoming
 		return true
@@ -200,24 +169,24 @@ local function RaiseNumber(dest, key, srcValue)
 	return false
 end
 
-RaiseMergeRecord = function(dest, src)
+function ns.RaiseMergeRecord(dest, src)
 	if type(dest) ~= "table" or type(src) ~= "table" or dest == src then
 		return false
 	end
 	local raised = false
-	if RaiseNumber(dest, "jumps", src.jumps) then
+	if ns.RaiseNumber(dest, "jumps", src.jumps) then
 		raised = true
 	end
-	if RaiseNumber(dest, "xp", src.xp) then
+	if ns.RaiseNumber(dest, "xp", src.xp) then
 		raised = true
 	end
-	if RaiseNumber(dest, "playTime", src.playTime) then
+	if ns.RaiseNumber(dest, "playTime", src.playTime) then
 		raised = true
 	end
-	if RaiseNumber(dest, "jumpActivityTime", src.jumpActivityTime) then
+	if ns.RaiseNumber(dest, "jumpActivityTime", src.jumpActivityTime) then
 		raised = true
 	end
-	if RaiseNumber(dest, "sessionJumpHigh", src.sessionJumpHigh) then
+	if ns.RaiseNumber(dest, "sessionJumpHigh", src.sessionJumpHigh) then
 		raised = true
 	end
 	if type(src.achievements) == "table" then
@@ -241,7 +210,7 @@ RaiseMergeRecord = function(dest, src)
 				if type(existing) ~= "table" then
 					dest.board[key] = entry
 					raised = true
-				elseif ToNumberOr(entry.jumps, 0) > ToNumberOr(existing.jumps, 0) then
+				elseif ns.ToNumberOr(entry.jumps, 0) > ns.ToNumberOr(existing.jumps, 0) then
 					dest.board[key] = entry
 					raised = true
 				end
@@ -249,7 +218,7 @@ RaiseMergeRecord = function(dest, src)
 		end
 	end
 	if type(src.jumpXPBar) == "table" then
-		local preferred = PreferJumpXPBar(dest.jumpXPBar, src.jumpXPBar)
+		local preferred = ns.PreferJumpXPBar(dest.jumpXPBar, src.jumpXPBar)
 		if preferred then
 			dest.jumpXPBar = preferred
 			if dest.jumpXPBar.shown then
@@ -264,9 +233,9 @@ RaiseMergeRecord = function(dest, src)
 		end
 		for layoutName, layout in pairs(src.jumpXPBarLayouts) do
 			if type(layout) == "table" then
-				local preferred = PreferJumpXPBar(dest.jumpXPBarLayouts[layoutName], layout)
+				local preferred = ns.PreferJumpXPBar(dest.jumpXPBarLayouts[layoutName], layout)
 				if preferred or type(dest.jumpXPBarLayouts[layoutName]) ~= "table" then
-					dest.jumpXPBarLayouts[layoutName] = preferred or CopyJumpXPBarTable(layout)
+					dest.jumpXPBarLayouts[layoutName] = preferred or ns.CopyJumpXPBarTable(layout)
 					raised = true
 				end
 			end
@@ -282,15 +251,10 @@ RaiseMergeRecord = function(dest, src)
 	return raised
 end
 
--- Forever sometimes leaves AJHAccount/AJHFloor/AJHDB nil even when the WTF
--- SavedVariables file on disk is valid (diag: CLIENT_LOAD_FAIL). Re-read ONLY
--- the official SV files under WTF/ — never Interface/AddOns. Raise-merge only.
-local lastHydrateNote = "not-run"
-
 local debugLogLines = {}
 local debugCopyFrame
 
-local function DebugChat(msg)
+function ns.DebugChat(msg)
 	local line = tostring(msg)
 	debugLogLines[#debugLogLines + 1] = line
 	if #debugLogLines > 200 then
@@ -301,11 +265,11 @@ local function DebugChat(msg)
 	end
 end
 
-local function GetDebugLogText()
+function ns.GetDebugLogText()
 	return table.concat(debugLogLines, "\n")
 end
 
-local function ShowDebugCopyFrame(text)
+function ns.ShowDebugCopyFrame(text)
 	if not debugCopyFrame then
 		local f = CreateFrame("Frame", "AJHDebugCopyFrame", UIParent, BackdropTemplate and "BackdropTemplate" or nil)
 		f:SetSize(520, 360)
@@ -338,7 +302,7 @@ local function ShowDebugCopyFrame(text)
 
 		local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 		title:SetPoint("TOP", 0, -14)
-		title:SetText("AJH Debug — Ctrl+A then Ctrl+C")
+		title:SetText("AJH Debug ? Ctrl+A then Ctrl+C")
 
 		local scroll = CreateFrame("ScrollFrame", "AJHDebugCopyScroll", f, "UIPanelScrollFrameTemplate")
 		scroll:SetPoint("TOPLEFT", 16, -36)
@@ -378,311 +342,32 @@ local function ShowDebugCopyFrame(text)
 	f.edit:HighlightText()
 end
 
-local function DebugDump(tag)
+function ns.DebugDump(tag)
 	-- Automatic login dumps only in local-dev. Manual `/ajh copy` always works.
 	if not DEV_TOOLS and not (type(tag) == "string" and tag:find("manual", 1, true)) then
 		return
 	end
 	local name = UnitName("player") or "?"
-	local guid = UnitGUID("player") or "?"
-	local key = PlayerKey() or "?"
-	local function jOf(tbl)
-		if type(tbl) ~= "table" then
-			return "nil"
-		end
-		return tostring(ToNumberOr(tbl.jumps, 0))
+	local jumps = "nil"
+	local xp = "nil"
+	if type(AJHSaved) == "table" then
+		jumps = tostring(ns.ToNumberOr(ns.DB().jumps, 0))
+		xp = tostring(ns.ToNumberOr(ns.DB().xp, 0))
 	end
-	-- Forever may inject SV into _G while the addon env still sees nil.
-	local gAccount = rawget(_G, "AJHAccount")
-	local gFloor = rawget(_G, "AJHFloor")
-	local gDB = rawget(_G, "AJHDB")
-	local acctMax = 0
-	local srcAccount = (type(AJHAccount) == "table" and AJHAccount) or (type(gAccount) == "table" and gAccount)
-	if type(srcAccount) == "table" then
-		for _, rec in pairs(srcAccount) do
-			if type(rec) == "table" then
-				local j = ToNumberOr(rec.jumps, 0)
-				if j > acctMax then
-					acctMax = j
-				end
-			end
-		end
-	end
-	local nameRow = "nil"
-	if type(srcAccount) == "table" and type(srcAccount[name]) == "table" then
-		nameRow = jOf(srcAccount[name])
-	end
-	local guidRow = "nil"
-	if type(srcAccount) == "table" and type(srcAccount[guid]) == "table" then
-		guidRow = jOf(srcAccount[guid])
-	end
-	local acctFloor = "nil"
-	if type(srcAccount) == "table" then
-		acctFloor = jOf(srcAccount.__floor)
-	end
-	local floorBest = "nil"
-	local srcFloor = (type(AJHFloor) == "table" and AJHFloor) or (type(gFloor) == "table" and gFloor)
-	if type(srcFloor) == "table" then
-		floorBest = jOf(srcFloor.__best)
-	end
-	DebugChat("======== " .. tag .. " ========")
-	DebugChat("1 player=" .. name .. " addon=" .. tostring(ADDON_NAME) .. " key=" .. tostring(key))
-	DebugChat("2 env Account=" .. type(AJHAccount) .. " Floor=" .. type(AJHFloor) .. " DB=" .. type(AJHDB))
-	DebugChat("3 _G Account=" .. type(gAccount) .. " Floor=" .. type(gFloor) .. " DB=" .. type(gDB))
-	DebugChat("4 AJHDB.jumps=" .. jOf(AJHDB) .. " _G.AJHDB.jumps=" .. jOf(gDB))
-	DebugChat("5 AccountMax=" .. tostring(acctMax) .. " nameRow=" .. nameRow .. " guidRow=" .. guidRow)
-	DebugChat("6 __floor=" .. acctFloor .. " Floor.__best=" .. floorBest)
-	DebugChat("7 hydrate=" .. tostring(lastHydrateNote))
-	DebugChat("8 tocSV=AJHAccount+AJHFloor+perchar (locked)")
-	local dbShape = "nil"
-	if type(AJHDB) == "table" then
-		if type(AJHDB.jumps) == "number" then
-			dbShape = "char-row jumps=" .. tostring(AJHDB.jumps)
-		elseif AJHDB.__floor then
-			dbShape = "account-store"
-		else
-			local nested = false
-			for _, v in pairs(AJHDB) do
-				if type(v) == "table" and type(v.jumps) == "number" then
-					nested = true
-					break
-				end
-			end
-			dbShape = nested and "account-store" or "table-other"
-		end
-	end
-	DebugChat("9 AJHDB_shape=" .. dbShape .. " Account=" .. type(AJHAccount))
-	DebugChat("10 store=" .. type(rawget(_G, "AJHStoreDB")) .. " sta=" .. type(rawget(_G, "SpaceToAcceptDB")))
-	DebugChat("======== end ========")
+	ns.DebugChat("======== " .. tag .. " ========")
+	ns.DebugChat("1 player=" .. name .. " addon=" .. tostring(ADDON_NAME))
+	ns.DebugChat("2 type(AJHSaved)=" .. type(AJHSaved) .. " jumps=" .. jumps .. " xp=" .. xp)
+	ns.DebugChat("======== end ========")
 end
 
--- If Forever put SV on _G but not in the addon env, pull them in.
-local function SyncSavedVarsFromGlobal()
-	if type(AJHAccount) ~= "table" and type(rawget(_G, "AJHAccount")) == "table" then
-		AJHAccount = rawget(_G, "AJHAccount")
-	end
-	if type(AJHFloor) ~= "table" and type(rawget(_G, "AJHFloor")) == "table" then
-		AJHFloor = rawget(_G, "AJHFloor")
-	end
-	local gDB = rawget(_G, "AJHDB")
-	if type(AJHDB) ~= "table" and type(gDB) == "table" then
-		AJHDB = gDB
-	end
-end
-
--- Forever may inject the account store as AJHDB (mis-named) or leave a legacy
--- AJHAccount table. Normalize so the rest of the addon always sees AJHAccount
--- as the account store; EnsureDB then rebinds AJHDB to the character row.
-local function AbsorbAccountStoreFromAJHDB()
-	if type(AJHDB) ~= "table" then
-		return false
-	end
-	local key = PlayerKey()
-	local name = UnitName("player")
-	local hasNestedPlayer = false
-	for k, v in pairs(AJHDB) do
-		if k == "__floor" or (type(v) == "table" and type(v.jumps) == "number") then
-			hasNestedPlayer = true
-			break
-		end
-	end
-	-- Character-row shape (legacy per-char SV): top-level jumps, no nested players.
-	if type(AJHDB.jumps) == "number" and not AJHDB.__floor and not hasNestedPlayer then
-		if type(AJHAccount) ~= "table" then
-			AJHAccount = {}
-		end
-		if key then
-			AJHAccount[key] = AJHDB
-		end
-		if type(name) == "string" and name ~= "" then
-			AJHAccount[name] = AJHDB
-		end
-		return true
-	end
-	-- Account-store shape: nested player keys / __floor.
-	if hasNestedPlayer or type(AJHDB.jumps) ~= "number" then
-		local looksAccount = false
-		for k, v in pairs(AJHDB) do
-			if k == "__floor" or (type(v) == "table" and type(v.jumps) == "number") then
-				looksAccount = true
-				break
-			end
-		end
-		if looksAccount then
-			AJHAccount = AJHDB
-			return true
-		end
-	end
-	return false
-end
-
-local function TryHydrateSavedVariablesFromWTF()
-	if not (io and io.open) then
-		lastHydrateNote = "no-io-api"
-		return false
-	end
-	local paths = {
-		"WTF/Account/100206261#2/SavedVariables/AJH.lua",
-		"WTF\\Account\\100206261#2\\SavedVariables\\AJH.lua",
-		"WTF/Account/100206261#2/SavedVariables/AJH.lua.bak",
-		"WTF\\Account\\100206261#2\\SavedVariables\\AJH.lua.bak",
-		"D:/World of Warcraft/_classic_beta_/WTF/Account/100206261#2/SavedVariables/AJH.lua",
-		"D:\\World of Warcraft\\_classic_beta_\\WTF\\Account\\100206261#2\\SavedVariables\\AJH.lua",
-		"D:/World of Warcraft/_classic_beta_/WTF/Account/100206261#2/SavedVariables/AJH.lua.bak",
-		"D:\\World of Warcraft\\_classic_beta_\\WTF\\Account\\100206261#2\\SavedVariables\\AJH.lua.bak",
-		"WTF/Account/100206261#2/70/Resist-Rex/SavedVariables/AJH.lua",
-		"D:/World of Warcraft/_classic_beta_/WTF/Account/100206261#2/70/Resist-Rex/SavedVariables/AJH.lua",
-	}
-	local function readBody(path)
-		local ok, body = pcall(function()
-			local f = io.open(path, "r")
-			if not f then
-				return nil
-			end
-			local data = f:read("*a")
-			f:close()
-			return data
-		end)
-		if ok and type(body) == "string" and body ~= "" then
-			return body
-		end
-		return nil
-	end
-	local function parse(body)
-		if type(body) ~= "string" then
-			return nil, nil, nil
-		end
-		if body:match("AJHAccount%s*=%s*nil") and not body:match("AJHAccount%s*=%s*{")
-			and not body:match("AJHFloor%s*=%s*{")
-			and not body:match("AJHDB%s*=%s*{")
-		then
-			return nil, nil, nil
-		end
-		local loader = loadstring or load
-		if not loader then
-			return nil, nil, nil
-		end
-		local env = {}
-		local fn
-		if setfenv then
-			fn = loader(body)
-			if fn then
-				setfenv(fn, env)
-			end
-		else
-			fn = loader(body, "AJH_sv_hydrate", "t", env)
-		end
-		if not fn or not pcall(fn) then
-			return nil, nil, nil
-		end
-		return env.AJHAccount, env.AJHFloor, env.AJHDB
-	end
-	local function mergeAccount(account)
-		if type(account) ~= "table" then
-			return false
-		end
-		local raised = false
-		if type(AJHAccount) ~= "table" then
-			AJHAccount = account
-			return true
-		end
-		for key, rec in pairs(account) do
-			if type(rec) == "table" then
-				if type(AJHAccount[key]) ~= "table" then
-					AJHAccount[key] = rec
-					raised = true
-				elseif RaiseMergeRecord(AJHAccount[key], rec) then
-					raised = true
-				end
-			end
-		end
-		return raised
-	end
-	local function mergeFloor(floor)
-		if type(floor) ~= "table" then
-			return false
-		end
-		local raised = false
-		if type(AJHFloor) ~= "table" then
-			AJHFloor = floor
-			return true
-		end
-		for key, rec in pairs(floor) do
-			if type(rec) == "table" then
-				if type(AJHFloor[key]) ~= "table" then
-					AJHFloor[key] = rec
-					raised = true
-				elseif RaiseMergeRecord(AJHFloor[key], rec) then
-					raised = true
-				end
-			end
-		end
-		return raised
-	end
-	local function mergeChar(db)
-		if type(db) ~= "table" then
-			return false
-		end
-		if ToNumberOr(db.jumps, 0) <= 0 and ToNumberOr(db.xp, 0) <= 0 then
-			return false
-		end
-		if type(AJHDB) ~= "table" then
-			AJHDB = {}
-		end
-		return RaiseMergeRecord(AJHDB, db)
-	end
-
-	local raised = false
-	local opened = 0
-	local bestDisk = 0
-	for i = 1, #paths do
-		local body = readBody(paths[i])
-		if body then
-			opened = opened + 1
-			local account, floor, charDB = parse(body)
-			local diskJ = 0
-			if type(account) == "table" then
-				for _, rec in pairs(account) do
-					if type(rec) == "table" then
-						local j = ToNumberOr(rec.jumps, 0)
-						if j > diskJ then
-							diskJ = j
-						end
-					end
-				end
-			end
-			if type(charDB) == "table" then
-				local j = ToNumberOr(charDB.jumps, 0)
-				if j > diskJ then
-					diskJ = j
-				end
-			end
-			if diskJ > bestDisk then
-				bestDisk = diskJ
-			end
-			if mergeAccount(account) then
-				raised = true
-			end
-			if mergeFloor(floor) then
-				raised = true
-			end
-			if mergeChar(charDB) then
-				raised = true
-			end
-		end
-	end
-	lastHydrateNote = string.format("opened=%d bestDisk=%d raised=%s", opened, bestDisk, raised and "yes" or "no")
-	return raised
-end
-
-local function FillDBDefaults(db)
-	local jumps = ToNumberOr(db.jumps, nil)
+function ns.FillDBDefaults(db)
+	local jumps = ns.ToNumberOr(db.jumps, nil)
 	if type(jumps) ~= "number" then
 		jumps = 0
 	end
 	db.jumps = jumps
 
-	local xp = ToNumberOr(db.xp, nil)
+	local xp = ns.ToNumberOr(db.xp, nil)
 	if type(xp) ~= "number" then
 		xp = db.jumps * XP_PER_JUMP
 	elseif db.jumps > 0 and xp == db.jumps * 10 then
@@ -693,7 +378,7 @@ local function FillDBDefaults(db)
 	if type(db.board) ~= "table" then
 		db.board = {}
 	end
-	db.minimapPos = ToNumberOr(db.minimapPos, 210)
+	db.minimapPos = ns.ToNumberOr(db.minimapPos, 210)
 	if type(db.minimapPos) ~= "number" then
 		db.minimapPos = 210
 	end
@@ -723,13 +408,13 @@ local function FillDBDefaults(db)
 			barDB.point = src.point
 		end
 		if barDB.x == nil then
-			barDB.x = ToNumberOr(src.x, nil)
+			barDB.x = ns.ToNumberOr(src.x, nil)
 		end
 		if barDB.y == nil then
-			barDB.y = ToNumberOr(src.y, nil)
+			barDB.y = ns.ToNumberOr(src.y, nil)
 		end
 		if barDB.widthPct == nil then
-			barDB.widthPct = ToNumberOr(src.widthPct, nil)
+			barDB.widthPct = ns.ToNumberOr(src.widthPct, nil)
 		end
 	end
 
@@ -745,11 +430,11 @@ local function FillDBDefaults(db)
 		local layouts = db.jumpXPBarLayouts
 		adoptPos(layouts.__legacy)
 		-- Prefer the highest-scoring saved Edit Mode layout over defaults / partial bars.
-		local bestLayout, bestScore = nil, JumpXPBarLayoutScore(barDB)
+		local bestLayout, bestScore = nil, ns.JumpXPBarLayoutScore(barDB)
 		for _, data in pairs(layouts) do
 			if type(data) == "table" and data.point then
 				adoptPos(data)
-				local score = JumpXPBarLayoutScore(data)
+				local score = ns.JumpXPBarLayoutScore(data)
 				if score > bestScore then
 					bestLayout, bestScore = data, score
 				end
@@ -757,13 +442,13 @@ local function FillDBDefaults(db)
 		end
 		if bestLayout then
 			barDB.point = bestLayout.point or barDB.point
-			barDB.x = ToNumberOr(bestLayout.x, barDB.x)
-			barDB.y = ToNumberOr(bestLayout.y, barDB.y)
-			barDB.widthPct = ToNumberOr(bestLayout.widthPct, barDB.widthPct)
+			barDB.x = ns.ToNumberOr(bestLayout.x, barDB.x)
+			barDB.y = ns.ToNumberOr(bestLayout.y, barDB.y)
+			barDB.widthPct = ns.ToNumberOr(bestLayout.widthPct, barDB.widthPct)
 			if bestLayout.userPlaced then
 				barDB.userPlaced = true
 			end
-			-- Do not copy shown from layouts here — visibility is independent.
+			-- Do not copy shown from layouts here ? visibility is independent.
 		end
 	else
 		db.jumpXPBarLayouts = {}
@@ -772,9 +457,9 @@ local function FillDBDefaults(db)
 	if type(barDB.point) ~= "string" then
 		barDB.point = "BOTTOM"
 	end
-	barDB.x = ToNumberOr(barDB.x, 0) or 0
-	barDB.y = ToNumberOr(barDB.y, 55) or 55
-	barDB.widthPct = ToNumberOr(barDB.widthPct, 100) or 100
+	barDB.x = ns.ToNumberOr(barDB.x, 0) or 0
+	barDB.y = ns.ToNumberOr(barDB.y, 55) or 55
+	barDB.widthPct = ns.ToNumberOr(barDB.widthPct, 100) or 100
 	if barDB.widthPct < 50 then
 		barDB.widthPct = 50
 	elseif barDB.widthPct > 100 then
@@ -787,23 +472,27 @@ local function FillDBDefaults(db)
 	else
 		db.soundsEnabled = not not db.soundsEnabled
 	end
-	db.soundVolume = ToNumberOr(db.soundVolume, 100) or 100
+	db.soundVolume = ns.ToNumberOr(db.soundVolume, 100) or 100
 	if db.soundVolume < 0 then
 		db.soundVolume = 0
 	elseif db.soundVolume > 100 then
 		db.soundVolume = 100
 	end
 	if db.autoAnnounce == nil then
-		db.autoAnnounce = true
+		db.autoAnnounce = false
 	else
 		db.autoAnnounce = not not db.autoAnnounce
 	end
-	db.sessionJumpHigh = math.max(0, math.floor(ToNumberOr(db.sessionJumpHigh, 0) or 0))
-	db.playTime = math.max(0, ToNumberOr(db.playTime, 0) or 0)
-	db.jumpActivityTime = math.max(0, ToNumberOr(db.jumpActivityTime, 0) or 0)
+	db.sessionJumpHigh = math.max(0, math.floor(ns.ToNumberOr(db.sessionJumpHigh, 0) or 0))
+	db.playTime = math.max(0, ns.ToNumberOr(db.playTime, 0) or 0)
+	db.jumpActivityTime = math.max(0, ns.ToNumberOr(db.jumpActivityTime, 0) or 0)
+	if type(db.jumpDayKeys) ~= "table" then
+		db.jumpDayKeys = {}
+	end
+	db.announceCount = math.max(0, math.floor(ns.ToNumberOr(db.announceCount, 0) or 0))
 end
 
-local function RaiseFromOwnBoard(rec)
+function ns.RaiseFromOwnBoard(rec)
 	if type(rec) ~= "table" or type(rec.board) ~= "table" then
 		return false
 	end
@@ -816,11 +505,11 @@ local function RaiseFromOwnBoard(rec)
 	for boardKey, entry in pairs(rec.board) do
 		if type(entry) == "table" and type(boardKey) == "string" then
 			if boardKey == name or boardKey:sub(1, #prefix) == prefix then
-				if RaiseNumber(rec, "jumps", entry.jumps) then
+				if ns.RaiseNumber(rec, "jumps", entry.jumps) then
 					raised = true
 				end
 				-- Board only stores jumps; keep xp at least in sync with jumps.
-				if RaiseNumber(rec, "xp", entry.jumps) then
+				if ns.RaiseNumber(rec, "xp", entry.jumps) then
 					raised = true
 				end
 			end
@@ -829,628 +518,127 @@ local function RaiseFromOwnBoard(rec)
 	return raised
 end
 
-local function IsWatermarkRecord(record)
-	-- Only dedicated watermark slots — never treat player AJHFloor/AJHAccount
-	-- identity rows as watermarks (that blocked them from being canonical).
-	if type(record) ~= "table" then
+-- Forever sometimes leaves AJHSaved nil after /reload or a full restart even
+-- when the WTF file is fine. Creating AJHSaved = {} would then be saved over
+-- the good file. Use an ephemeral session table until/unless AJHSaved appears.
+local svReady = false
+local sessionDB = nil
+local liveDB = nil
+local warnedMissingSV = false
+
+function ns.AdoptSavedIfPresent()
+	if type(AJHSaved) ~= "table" then
 		return false
 	end
-	if type(AJHAccount) == "table" and record == AJHAccount.__floor then
-		return true
+	if sessionDB and sessionDB ~= AJHSaved then
+		ns.RaiseMergeRecord(AJHSaved, sessionDB)
+		sessionDB = nil
 	end
-	if type(AJHFloor) == "table" and record == AJHFloor.__best then
-		return true
-	end
-	return false
-end
-
-local function CollectFloorCandidates(name, guid, key)
-	local out = {}
-	local function consider(record)
-		if type(record) == "table" then
-			out[#out + 1] = record
-		end
-	end
-	if type(AJHAccount) == "table" then
-		consider(AJHAccount.__floor)
-	end
-	if type(AJHFloor) ~= "table" then
-		return out
-	end
-	consider(AJHFloor.__best)
-	consider(key and AJHFloor[key])
-	consider(name and AJHFloor[name])
-	consider(guid and AJHFloor[guid])
-	for floorKey, floorRec in pairs(AJHFloor) do
-		if floorKey ~= "__best" and type(floorRec) == "table" then
-			if (guid and floorKey == guid)
-				or (name and (floorKey == name or (type(floorKey) == "string" and floorKey:sub(1, #name + 1) == (name .. "-"))))
-			then
-				consider(floorRec)
-			end
-		end
-	end
-	return out
-end
-
-local function CommitFloor()
-	local key = PlayerKey()
-	if not key or type(AJHDB) ~= "table" or type(AJHAccount) ~= "table" then
-		return
-	end
-
-	local liveJumps = ToNumberOr(AJHDB.jumps, 0)
-	local liveXp = ToNumberOr(AJHDB.xp, 0)
-	-- Never seed a zero watermark. A blank in-memory session must not
-	-- overwrite richer account data on logout.
-	if liveJumps <= 0 and liveXp <= 0 then
-		return
-	end
-
-	local name = UnitName("player")
-	local guid = UnitGUID("player")
-	-- Heal live progress from every watermark before the client writes WTF.
-	for _, src in ipairs(CollectFloorCandidates(name, guid, key)) do
-		RaiseMergeRecord(AJHDB, src)
-	end
-	liveJumps = ToNumberOr(AJHDB.jumps, 0)
-	liveXp = ToNumberOr(AJHDB.xp, 0)
-	if liveJumps <= 0 then
-		return
-	end
-
-	if type(AJHAccount.__floor) ~= "table" then
-		AJHAccount.__floor = {}
-	end
-	RaiseNumber(AJHAccount.__floor, "jumps", liveJumps)
-	RaiseNumber(AJHAccount.__floor, "xp", liveXp)
-	if type(AJHDB.achievements) == "table" then
-		if type(AJHAccount.__floor.achievements) ~= "table" then
-			AJHAccount.__floor.achievements = {}
-		end
-		for id, when in pairs(AJHDB.achievements) do
-			if AJHAccount.__floor.achievements[id] == nil then
-				AJHAccount.__floor.achievements[id] = when
-			end
-		end
-	end
-	if type(AJHDB.jumpXPBar) == "table" then
-		if type(AJHAccount.__floor.jumpXPBar) ~= "table"
-			or JumpXPBarScore(AJHDB.jumpXPBar) > JumpXPBarScore(AJHAccount.__floor.jumpXPBar)
-		then
-			AJHAccount.__floor.jumpXPBar = CopyJumpXPBarTable(AJHDB.jumpXPBar)
-		end
-	end
-end
-
--- Forever injects SavedVariables at VARIABLES_LOADED. Creating AJHDB={} before
--- that (e.g. via BuildJumpXPBar → EnsureDB at ADDON_LOADED) poisons the session
--- with an empty char DB while Account/Floor are still nil.
-local variablesLoadedFired = false
-
-local function EnsureDB()
-	if not variablesLoadedFired then
-		return
-	end
-
-	SyncSavedVarsFromGlobal()
-	-- If Forever left SV globals empty, re-read the official WTF files first.
-	if MaxProgressInAccountSV() <= 0 then
-		TryHydrateSavedVariablesFromWTF()
-		SyncSavedVarsFromGlobal()
-	end
-
-	-- Merge into existing SV tables only. Forever TOC declares AJHAccount only
-	-- (SpaceToAccept pattern). AJHDB is a runtime alias to the player row —
-	-- never a separate SavedVariable. AJHFloor is legacy/read-only if present.
-	if type(AJHDB) ~= "table" then
-		AJHDB = {}
-	end
-
-	local key = PlayerKey()
-	if not key then
-		-- Player identity not ready yet. Do not create account keys here —
-		-- an empty bind on ADDON_LOADED can overwrite richer aliases on save.
-		FillDBDefaults(AJHDB)
-		return
-	end
-
-	local name = UnitName("player")
-	local guid = UnitGUID("player")
-	local accountPresent = type(AJHAccount) == "table"
-	local floorPresent = type(AJHFloor) == "table"
-
-	-- Gather every known copy. Forever sometimes loads one key and not the other,
-	-- or leaves AJHDB empty while AJHAccount still has progress.
-	local candidates = {}
-	local function consider(record)
-		if type(record) == "table" then
-			candidates[#candidates + 1] = record
-		end
-	end
-	if accountPresent then
-		consider(AJHAccount[key])
-		if type(name) == "string" and name ~= "" then
-			consider(AJHAccount[name])
-		end
-		if type(guid) == "string" and guid ~= "" and guid ~= key then
-			consider(AJHAccount[guid])
-		end
-		consider(AJHAccount.__floor)
-	end
-	if type(AJHDB) == "table" then
-		consider(AJHDB)
-	end
-	if floorPresent then
-		for _, floorRec in ipairs(CollectFloorCandidates(name, guid, key)) do
-			consider(floorRec)
-		end
-	end
-
-	-- Canonical record = richest player-owned candidate. Never promote a
-	-- watermark table into the live player slot.
-	local rec = nil
-	local bestJumps = -1
-	for i = 1, #candidates do
-		local c = candidates[i]
-		if not IsWatermarkRecord(c) then
-			local j = ToNumberOr(c.jumps, 0)
-			if j > bestJumps then
-				rec = c
-				bestJumps = j
-			end
-		end
-	end
-	if type(rec) ~= "table" then
-		rec = {}
-	end
-
-	for i = 1, #candidates do
-		local c = candidates[i]
-		if c ~= rec then
-			RaiseMergeRecord(rec, c)
-		end
-	end
-
-	RaiseFromOwnBoard(rec)
-	FillDBDefaults(rec)
-
-	local jumps = ToNumberOr(rec.jumps, 0)
-	local watermarkMax = 0
-	for i = 1, #candidates do
-		local c = candidates[i]
-		if IsWatermarkRecord(c) then
-			local wj = ToNumberOr(c.jumps, 0)
-			if wj > watermarkMax then
-				watermarkMax = wj
-			end
-		end
-	end
-	-- Never allow a live bind below a known watermark (partial merge / shared-table miss).
-	if jumps < watermarkMax then
-		for i = 1, #candidates do
-			RaiseMergeRecord(rec, candidates[i])
-		end
-		jumps = ToNumberOr(rec.jumps, 0)
-	end
-
-	if jumps <= 0 then
-		-- Blank session: keep a throwaway display table and do NOT create or
-		-- clobber account SavedVariables. Writing zeros is what wipes players
-		-- when Forever fails to load the real WTF data into memory.
-		AJHDB = rec
-		return
-	end
-
-	-- Demotion guard: if account already holds a richer row, raise into it and
-	-- keep that table identity so logout cannot serialize a lower alias.
-	if accountPresent then
-		local existing = AJHAccount[key]
-		if type(existing) == "table" and existing ~= rec then
-			local existingJumps = ToNumberOr(existing.jumps, 0)
-			if existingJumps > jumps then
-				RaiseMergeRecord(existing, rec)
-				rec = existing
-				jumps = ToNumberOr(rec.jumps, 0)
-			else
-				RaiseMergeRecord(rec, existing)
-			end
-		end
-	end
-
-	if not accountPresent then
-		AJHAccount = {}
-	end
-
-	-- Point every identity key at the SAME table so a later save cannot
-	-- serialize an empty alias over the good one.
-	AJHAccount[key] = rec
-	if type(name) == "string" and name ~= "" then
-		AJHAccount[name] = rec
-	end
-	if type(guid) == "string" and guid ~= "" then
-		AJHAccount[guid] = rec
-	end
-
-	AJHDB = rec
-	CommitFloor()
-end
-
--- Forever often fails to inject AJHAccount/AJHDB on login even when WTF is
--- valid. Mirror progress into AJHStoreDB (companion addon) and, as a backup,
--- SpaceToAcceptDB.AJH — same SV pattern SpaceToAccept loads successfully.
--- Do NOT hardcode jump floors in shipping builds (that would gift/wipe everyone).
-local function CopyAccountStore(src)
-	if type(src) ~= "table" then
-		return nil
-	end
-	local out = {}
-	for k, v in pairs(src) do
-		if type(v) == "table" then
-			local row = {}
-			for rk, rv in pairs(v) do
-				if type(rv) ~= "table" then
-					row[rk] = rv
-				elseif rk == "achievements" or rk == "board" or rk == "jumpXPBarLayouts" then
-					local nested = {}
-					for nk, nv in pairs(rv) do
-						nested[nk] = nv
-					end
-					row[rk] = nested
-				elseif rk == "jumpXPBar" then
-					row[rk] = CopyJumpXPBarTable(rv)
-				end
-			end
-			out[k] = row
-		else
-			out[k] = v
-		end
-	end
-	return out
-end
-
-local function MaxJumpsInStore(store)
-	local best = 0
-	if type(store) ~= "table" then
-		return best
-	end
-	for _, rec in pairs(store) do
-		if type(rec) == "table" then
-			local j = ToNumberOr(rec.jumps, 0)
-			if j > best then
-				best = j
-			end
-		end
-	end
-	return best
-end
-
-local function PersistProgressMirror()
-	if type(AJHAccount) ~= "table" then
-		return
-	end
-	if MaxProgressInAccountSV() <= 0 then
-		return
-	end
-	local snapshot = CopyAccountStore(AJHAccount)
-	if not snapshot then
-		return
-	end
-	if type(AJHStoreDB) ~= "table" then
-		AJHStoreDB = {}
-	end
-	-- Raise-only: never demote a richer mirror.
-	if MaxJumpsInStore(snapshot) >= MaxJumpsInStore(AJHStoreDB.account) then
-		AJHStoreDB.account = snapshot
-		AJHStoreDB.jumps = MaxJumpsInStore(snapshot)
-		AJHStoreDB.updated = time and time() or 0
-	end
-	if type(SpaceToAcceptDB) == "table" then
-		local prev = SpaceToAcceptDB.AJH
-		if type(prev) ~= "table" or MaxJumpsInStore(snapshot) >= MaxJumpsInStore(prev.account) then
-			SpaceToAcceptDB.AJH = {
-				account = snapshot,
-				jumps = MaxJumpsInStore(snapshot),
-			}
-		end
-	end
-	if _G then
-		rawset(_G, "AJHStoreDB", AJHStoreDB)
-	end
-end
-
-local function RestoreProgressMirror()
-	local candidates = {}
-	if type(AJHStoreDB) == "table" and type(AJHStoreDB.account) == "table" then
-		candidates[#candidates + 1] = { src = "AJHStoreDB", store = AJHStoreDB.account }
-	end
-	local sta = rawget(_G, "SpaceToAcceptDB")
-	if type(sta) == "table" and type(sta.AJH) == "table" and type(sta.AJH.account) == "table" then
-		candidates[#candidates + 1] = { src = "SpaceToAcceptDB", store = sta.AJH.account }
-	end
-	local best, bestSrc, bestJ = nil, nil, 0
-	for i = 1, #candidates do
-		local j = MaxJumpsInStore(candidates[i].store)
-		if j > bestJ then
-			bestJ = j
-			best = candidates[i].store
-			bestSrc = candidates[i].src
-		end
-	end
-	if not best or bestJ <= 0 then
-		return false
-	end
-	local accountJ = MaxProgressInAccountSV()
-	if type(AJHAccount) == "table" and accountJ >= bestJ then
-		return false
-	end
-	AJHAccount = CopyAccountStore(best) or best
-	lastHydrateNote = "mirror-" .. tostring(bestSrc) .. "-" .. tostring(bestJ)
+	ns.FillDBDefaults(AJHSaved)
+	liveDB = AJHSaved
 	return true
 end
 
-local function HealProgressOnLogin()
-	local beforeJumps = 0
-	local beforeXp = 0
-	if type(AJHDB) == "table" then
-		beforeJumps = ToNumberOr(AJHDB.jumps, 0)
-		beforeXp = ToNumberOr(AJHDB.xp, 0)
+function ns.EnsureDB()
+	if ns.AdoptSavedIfPresent() then
+		return AJHSaved
 	end
-	SyncSavedVarsFromGlobal()
-	AbsorbAccountStoreFromAJHDB()
-	local mirrored = RestoreProgressMirror()
-	if mirrored and DEFAULT_CHAT_FRAME then
-		DEFAULT_CHAT_FRAME:AddMessage(
-			"|cff88ff88AJH:|r Restored Jump Habit progress from companion store."
-		)
+	if not svReady then
+		liveDB = nil
+		return nil
 	end
-	EnsureDB()
-	if MaxProgressInAccountSV() > 0 or (type(AJHDB) == "table" and ToNumberOr(AJHDB.jumps, 0) > 0) then
-		PersistProgressMirror()
+	if not sessionDB then
+		sessionDB = {}
+		ns.FillDBDefaults(sessionDB)
+		if not warnedMissingSV and DEFAULT_CHAT_FRAME then
+			warnedMissingSV = true
+			DEFAULT_CHAT_FRAME:AddMessage(
+				"|cffff6666AJH:|r Forever failed to load saved progress. This session is temporary and will |cffffcc00not|r overwrite your WTF file. Try another /reload or a full restart later."
+			)
+		end
 	end
-	local afterJumps = ToNumberOr(AJHDB and AJHDB.jumps, 0)
-	local afterXp = ToNumberOr(AJHDB and AJHDB.xp, 0)
-	return afterJumps > beforeJumps or afterXp > beforeXp
+	liveDB = sessionDB
+	return sessionDB
 end
 
--- StartLateLoadWatch is defined later (needs panel / diag locals).
+-- Gameplay reads/writes go through ns.DB() so ephemeral sessions work without
+-- assigning the empty table to the AJHSaved global (which would wipe WTF).
+function ns.DB()
+	if type(liveDB) == "table" then
+		return liveDB
+	end
+	return ns.EnsureDB()
+end
 
--- ---------------------------------------------------------------------------
--- Diagnostics (pre-release). Read-only snapshots of SV globals before/after
--- EnsureDB so we can tell client load failure from addon bind poisoning.
--- /ajh diag  — dump latest snapshots + verdict
--- /ajh diag on|off — toggle automatic chat spam (default off)
--- ---------------------------------------------------------------------------
-local DIAG_ENABLED = false -- /ajh diag on|off toggles automatic chat spam; /ajh diag always dumps
-local diagLog = {}
+function ns.TryLateSavedAdopt()
+	if not ns.AdoptSavedIfPresent() then
+		return
+	end
+	if DEFAULT_CHAT_FRAME then
+		DEFAULT_CHAT_FRAME:AddMessage(string.format(
+			"|cff88ff88AJH:|r Saved progress loaded late ? %s jumps (%s XP).",
+			tostring(AJHSaved.jumps or 0),
+			tostring(AJHSaved.xp or 0)
+		))
+	end
+	if panel then
+		panel:Update()
+	end
+	if ns.RestoreJumpXPBarFromSaved then
+		ns.RestoreJumpXPBarFromSaved()
+	end
+end
+
+-- Diagnostics stubs.
+local DIAG_ENABLED = false
 local diagRawAtAddonLoaded = nil
 local diagAfterBind = nil
 local diagAtLogout = nil
 
-local function DiagChat(msg)
+function ns.DiagChat(msg)
 	if DEFAULT_CHAT_FRAME then
 		DEFAULT_CHAT_FRAME:AddMessage("|cff88ccffAJH-DIAG:|r " .. msg)
 	end
 end
 
-local function DiagJumpsOf(rec)
-	if type(rec) ~= "table" then
-		return nil
-	end
-	return ToNumberOr(rec.jumps, 0)
-end
-
-local function DiagScanAccount()
-	local rows = {}
-	local maxJ = 0
-	if type(AJHAccount) ~= "table" then
-		return rows, maxJ
-	end
-	for k, rec in pairs(AJHAccount) do
-		if k ~= "__floor" and type(rec) == "table" then
-			local j = ToNumberOr(rec.jumps, 0)
-			rows[#rows + 1] = {
-				key = tostring(k),
-				jumps = j,
-				xp = ToNumberOr(rec.xp, 0),
-				sameAsDB = (rec == AJHDB),
-			}
-			if j > maxJ then
-				maxJ = j
-			end
-		end
-	end
-	table.sort(rows, function(a, b)
-		return a.key < b.key
-	end)
-	return rows, maxJ
-end
-
-local function DiagSnapshot(label)
-	local name = UnitName("player")
-	local guid = UnitGUID("player")
-	local key = PlayerKey()
-	local rows, maxAccount = DiagScanAccount()
-	local floorJ = 0
-	if type(AJHFloor) == "table" then
-		floorJ = math.max(
-			ToNumberOr(AJHFloor.__best and AJHFloor.__best.jumps, 0),
-			ToNumberOr(key and AJHFloor[key] and AJHFloor[key].jumps, 0),
-			ToNumberOr(name and AJHFloor[name] and AJHFloor[name].jumps, 0),
-			ToNumberOr(guid and AJHFloor[guid] and AJHFloor[guid].jumps, 0)
-		)
-	end
-	local acctFloorJ = ToNumberOr(
-		type(AJHAccount) == "table" and AJHAccount.__floor and AJHAccount.__floor.jumps,
-		0
-	)
-	local snap = {
+function ns.DiagSnapshot(label)
+	return {
 		label = label,
 		t = GetTime and GetTime() or 0,
-		accountType = type(AJHAccount),
-		floorType = type(AJHFloor),
-		dbType = type(AJHDB),
-		key = key and tostring(key) or "nil",
-		name = (type(name) == "string" and name ~= "" and name) or "nil",
-		guid = (type(guid) == "string" and guid ~= "" and guid) or "nil",
-		dbJumps = DiagJumpsOf(AJHDB),
-		maxAccountJumps = maxAccount,
-		accountFloorJumps = acctFloorJ,
-		floorJumps = floorJ,
-		rows = rows,
-		dbIsAccountRef = false,
+		dbType = type(AJHSaved),
+		dbJumps = type(AJHSaved) == "table" and ns.ToNumberOr(ns.DB().jumps, 0) or nil,
 	}
-	if type(AJHDB) == "table" and type(AJHAccount) == "table" then
-		for _, row in ipairs(rows) do
-			-- row.sameAsDB already computed
-			if row.sameAsDB then
-				snap.dbIsAccountRef = true
-				break
-			end
-		end
-		if AJHAccount.__floor == AJHDB then
-			snap.dbIsAccountRef = true
-		end
-	end
-	diagLog[#diagLog + 1] = snap
-	if #diagLog > 20 then
-		table.remove(diagLog, 1)
-	end
-	return snap
 end
 
-local function DiagPrintSnapshot(snap, verbose)
+function ns.DiagPrintSnapshot(snap, verbose)
 	if not snap then
-		DiagChat("no snapshot")
+		ns.DiagChat("no snapshot")
 		return
 	end
-	DiagChat(string.format(
-		"[%s] account=%s floorSV=%s db=%s key=%s name=%s",
-		snap.label,
-		snap.accountType,
-		snap.floorType,
-		snap.dbType,
-		snap.key,
-		snap.name
-	))
-	DiagChat(string.format(
-		"[%s] dbJumps=%s maxAccount=%s acctFloor=%s floorSV=%s dbAlias=%s",
-		snap.label,
-		tostring(snap.dbJumps),
-		tostring(snap.maxAccountJumps),
-		tostring(snap.accountFloorJumps),
-		tostring(snap.floorJumps),
-		snap.dbIsAccountRef and "yes" or "no"
-	))
-	if verbose and snap.rows then
-		for _, row in ipairs(snap.rows) do
-			DiagChat(string.format(
-				"  account[%s] jumps=%s xp=%s sameAsDB=%s",
-				row.key,
-				tostring(row.jumps),
-				tostring(row.xp),
-				row.sameAsDB and "yes" or "no"
-			))
-		end
-	end
+	ns.DiagChat(string.format("[%s] db=%s jumps=%s", snap.label, snap.dbType, tostring(snap.dbJumps)))
 end
 
-
-local function DiagVerdict()
-	local raw = diagRawAtAddonLoaded
-	local bound = diagAfterBind
-	if not raw then
-		return "INCOMPLETE", "No ADDON_LOADED/raw snapshot yet. /reload and watch chat."
-	end
-
-	local rawMax = math.max(
-		raw.maxAccountJumps or 0,
-		raw.floorJumps or 0,
-		raw.accountFloorJumps or 0,
-		raw.dbJumps or 0
-	)
-	local boundDb = bound and (bound.dbJumps or 0) or -1
-
-	-- Client handed us nothing useful from WTF.
-	if rawMax <= 0 then
-		if bound and boundDb > 0 then
-			return "CLIENT_LOAD_FAIL",
-				"SV globals were empty/zero at ADDON_LOADED; jumps appeared later. Forever likely failed to populate WTF into Lua at load (or file was already wiped)."
-		end
-		return "CLIENT_LOAD_FAIL_OR_WIPED_FILE",
-			"SV globals were empty/zero at ADDON_LOADED and still blank after bind. Either Forever failed to load WTF, or the file on disk was already wiped before this session."
-	end
-
-	-- Client loaded real progress.
-	if rawMax > 0 then
-		if bound and boundDb == 0 then
-			return "ADDON_BIND_BUG",
-				"WTF data WAS present at ADDON_LOADED (max jumps "
-					.. tostring(rawMax)
-					.. ") but after EnsureDB dbJumps=0. Addon bind poisoned progress."
-		end
-		if bound and boundDb > 0 and boundDb < rawMax then
-			return "ADDON_REGRESSION",
-				"Loaded max "
-					.. tostring(rawMax)
-					.. " from SV but ended at "
-					.. tostring(boundDb)
-					.. " after EnsureDB (possible bad merge)."
-		end
-		if bound and boundDb >= rawMax then
-			return "OK_CLIENT_LOADED",
-				"SV had progress at ADDON_LOADED (max "
-					.. tostring(rawMax)
-					.. ") and EnsureDB kept/raised it to "
-					.. tostring(boundDb)
-					.. ". Client load looks fine this session."
-		end
-		return "OK_CLIENT_LOADED",
-			"SV had progress at ADDON_LOADED (max " .. tostring(rawMax) .. "). Bind snapshot missing; check login diag lines."
-	end
-
-	return "UNKNOWN", "Could not classify. Paste /ajh diag output."
-end
-
-local function DiagReport(tag)
+function ns.DiagReport(tag)
 	if not DIAG_ENABLED and tag ~= "manual" then
 		return
 	end
-	local code, detail = DiagVerdict()
-	DiagChat("--- " .. (tag or "report") .. " ---")
-	DiagChat("VERDICT: " .. code)
-	DiagChat(detail)
-end
-
-local function ClearAccountProgress()
-	EnsureDB()
-	AJHDB.jumps = 0
-	AJHDB.xp = 0
-	if type(AJHAccount) == "table" and type(AJHAccount.__floor) == "table" then
-		AJHAccount.__floor.jumps = 0
-		AJHAccount.__floor.xp = 0
-	end
-	if type(AJHFloor) == "table" then
-		local key = PlayerKey()
-		local name = UnitName("player")
-		local guid = UnitGUID("player")
-		local function zeroFloor(slot)
-			if type(slot) == "string" and type(AJHFloor[slot]) == "table" then
-				AJHFloor[slot].jumps = 0
-				AJHFloor[slot].xp = 0
-			end
-		end
-		zeroFloor(key)
-		zeroFloor(name)
-		zeroFloor(guid)
-		if type(AJHFloor.__best) == "table" then
-			AJHFloor.__best.jumps = 0
-			AJHFloor.__best.xp = 0
-		end
+	ns.DiagChat("--- " .. (tag or "report") .. " ---")
+	ns.DiagChat("Simple persistence: AJHSaved only (type=" .. type(AJHSaved) .. ")")
+	if type(AJHSaved) == "table" then
+		ns.DiagChat("jumps=" .. tostring(ns.ToNumberOr(ns.DB().jumps, 0)) .. " xp=" .. tostring(ns.ToNumberOr(ns.DB().xp, 0)))
 	end
 end
 
-local function GetLevel(xp)
+function ns.ClearAccountProgress()
+	local db = ns.EnsureDB()
+	if not db then
+		return
+	end
+	db.jumps = 0
+	db.xp = 0
+end
+
+function ns.GetLevel(xp)
 	local level = 1
 	while level < MAX_LEVEL and xp >= xpForLevel[level + 1] do
 		level = level + 1
@@ -1465,20 +653,20 @@ end
 local campBenefitActive = false
 local campBenefitSpellID
 
-local function AuraNameMatchesCampBenefit(name)
+function ns.AuraNameMatchesCampBenefit(name)
 	if type(name) ~= "string" then
 		return false
 	end
 	return strlower(name):find("camp benefit", 1, true) ~= nil
 end
 
-local function RememberCampBenefitSpellID(spellID)
+function ns.RememberCampBenefitSpellID(spellID)
 	if type(spellID) == "number" and spellID > 0 then
 		campBenefitSpellID = spellID
 	end
 end
 
-local function TryFindCampBenefitByName()
+function ns.TryFindCampBenefitByName()
 	if not (AuraUtil and AuraUtil.FindAuraByName) then
 		return nil
 	end
@@ -1486,53 +674,53 @@ local function TryFindCampBenefitByName()
 	return name, spellID
 end
 
-local function TryGetPlayerAuraBySpellID(spellID)
+function ns.TryGetPlayerAuraBySpellID(spellID)
 	if not spellID or not (C_UnitAuras and C_UnitAuras.GetPlayerAuraBySpellID) then
 		return nil
 	end
 	return C_UnitAuras.GetPlayerAuraBySpellID(spellID)
 end
 
-local function TryGetAuraDataByIndex(index)
+function ns.TryGetAuraDataByIndex(index)
 	if not (C_UnitAuras and C_UnitAuras.GetAuraDataByIndex) then
 		return nil
 	end
 	return C_UnitAuras.GetAuraDataByIndex("player", index, "HELPFUL")
 end
 
-local function TryUnitBuffName(index)
+function ns.TryUnitBuffName(index)
 	if not UnitBuff then
 		return nil
 	end
 	return UnitBuff("player", index)
 end
 
-local function ScanCampBenefit()
+function ns.ScanCampBenefit()
 	-- Prefer name lookup; it is the least secret-hostile path.
-	local nameOk, name, spellID = pcall(TryFindCampBenefitByName)
+	local nameOk, name, spellID = pcall(ns.TryFindCampBenefitByName)
 	if not nameOk then
 		-- Name lookup tainted/secret. Do not iterate auras; try a known
 		-- spell ID if we have one, otherwise leave the multiplier off.
-		local idOk, data = pcall(TryGetPlayerAuraBySpellID, campBenefitSpellID)
+		local idOk, data = pcall(ns.TryGetPlayerAuraBySpellID, campBenefitSpellID)
 		return idOk and data ~= nil
 	end
-	if AuraNameMatchesCampBenefit(name) then
-		RememberCampBenefitSpellID(spellID)
+	if ns.AuraNameMatchesCampBenefit(name) then
+		ns.RememberCampBenefitSpellID(spellID)
 		return true
 	end
 
 	-- Exact name missed. Scan for substring variants, aborting on taint.
 	if C_UnitAuras and C_UnitAuras.GetAuraDataByIndex then
 		for i = 1, 40 do
-			local ok, data = pcall(TryGetAuraDataByIndex, i)
+			local ok, data = pcall(ns.TryGetAuraDataByIndex, i)
 			if not ok then
 				return false
 			end
 			if not data then
 				break
 			end
-			if AuraNameMatchesCampBenefit(data.name) then
-				RememberCampBenefitSpellID(data.spellId)
+			if ns.AuraNameMatchesCampBenefit(data.name) then
+				ns.RememberCampBenefitSpellID(data.spellId)
 				return true
 			end
 		end
@@ -1540,14 +728,14 @@ local function ScanCampBenefit()
 	end
 
 	for i = 1, 40 do
-		local ok, buffName = pcall(TryUnitBuffName, i)
+		local ok, buffName = pcall(ns.TryUnitBuffName, i)
 		if not ok then
 			return false
 		end
 		if not buffName then
 			break
 		end
-		if AuraNameMatchesCampBenefit(buffName) then
+		if ns.AuraNameMatchesCampBenefit(buffName) then
 			return true
 		end
 	end
@@ -1555,25 +743,25 @@ local function ScanCampBenefit()
 	return false
 end
 
-local function RefreshCampBenefit()
-	local found = ScanCampBenefit()
+function ns.RefreshCampBenefit()
+	local found = ns.ScanCampBenefit()
 	local changed = found ~= campBenefitActive
 	campBenefitActive = found
 	return changed
 end
 
-local function HasCampBenefit()
+function ns.HasCampBenefit()
 	return campBenefitActive
 end
 
-local function GetJumpXPGain()
+function ns.GetJumpXPGain()
 	if campBenefitActive then
 		return XP_PER_JUMP * CAMP_XP_MULTIPLIER
 	end
 	return XP_PER_JUMP
 end
 
-local function FormatNumber(n)
+function ns.FormatNumber(n)
 	local formatted = tostring(math.floor(n + 0.5))
 	while true do
 		local k
@@ -1585,11 +773,11 @@ local function FormatNumber(n)
 	return formatted
 end
 
-local function Solid(frame, r, g, b, a)
+function ns.Solid(frame, r, g, b, a)
 	frame:SetColorTexture(r, g, b, a)
 end
 
-local function PlayerIdentity()
+function ns.PlayerIdentity()
 	local name, realm = UnitFullName("player")
 	if not realm or realm == "" then
 		realm = GetNormalizedRealmName()
@@ -1599,58 +787,79 @@ local function PlayerIdentity()
 end
 
 -- Location feats (English client zone / subzone / minimap names).
--- Each entry: id, display name, match strings, optional mapIDs, optional instanceType.
+-- faction: "Alliance" | "Horde" | "Neutral" ? Neutral stays in Town for everyone;
+-- opposite-faction city/town feats resolve into the Hostile category at runtime.
 local CITY_LOCATIONS = {
-	{ id = "orgrimmar", name = "Orgrimmar", match = { "orgrimmar" } },
-	{ id = "thunder_bluff", name = "Thunder Bluff", match = { "thunder bluff" } },
-	{ id = "undercity", name = "Undercity", match = { "undercity" }, mapIDs = { 90 } },
-	{ id = "stormwind", name = "Stormwind City", match = { "stormwind city", "stormwind" } },
-	{ id = "ironforge", name = "Ironforge", match = { "ironforge" } },
-	{ id = "darnassus", name = "Darnassus", match = { "darnassus" } },
+	{ id = "orgrimmar", name = "Orgrimmar", faction = "Horde", match = { "orgrimmar" } },
+	{ id = "thunder_bluff", name = "Thunder Bluff", faction = "Horde", match = { "thunder bluff" } },
+	{ id = "undercity", name = "Undercity", faction = "Horde", match = { "undercity" }, mapIDs = { 90 } },
+	{ id = "stormwind", name = "Stormwind City", faction = "Alliance", match = { "stormwind city", "stormwind" } },
+	{ id = "ironforge", name = "Ironforge", faction = "Alliance", match = { "ironforge" } },
+	{ id = "darnassus", name = "Darnassus", faction = "Alliance", match = { "darnassus" } },
 }
 
 local TOWN_LOCATIONS = {
-	{ id = "brill", name = "Brill", match = { "brill" } },
-	{ id = "goldshire", name = "Goldshire", match = { "goldshire" } },
-	{ id = "razor_hill", name = "Razor Hill", match = { "razor hill" } },
-	{ id = "bloodhoof", name = "Bloodhoof Village", match = { "bloodhoof village" } },
-	{ id = "dolanaar", name = "Dolanaar", match = { "dolanaar" } },
-	{ id = "kharanos", name = "Kharanos", match = { "kharanos" } },
-	{ id = "senjin", name = "Sen'jin Village", match = { "sen'jin village" } },
-	{ id = "crossroads", name = "The Crossroads", match = { "the crossroads", "crossroads" } },
-	{ id = "tarren_mill", name = "Tarren Mill", match = { "tarren mill" } },
-	{ id = "southshore", name = "Southshore", match = { "southshore" } },
-	{ id = "booty_bay", name = "Booty Bay", match = { "booty bay" } },
-	{ id = "gadgetzan", name = "Gadgetzan", match = { "gadgetzan" } },
-	{ id = "everlook", name = "Everlook", match = { "everlook" } },
-	{ id = "ratchet", name = "Ratchet", match = { "ratchet" } },
-	{ id = "sentinel_hill", name = "Sentinel Hill", match = { "sentinel hill" } },
-	{ id = "lakeshire", name = "Lakeshire", match = { "lakeshire" } },
-	{ id = "darkshire", name = "Darkshire", match = { "darkshire" } },
-	{ id = "menethil", name = "Menethil Harbor", match = { "menethil harbor" } },
-	{ id = "theramore", name = "Theramore Isle", match = { "theramore isle", "theramore" } },
-	{ id = "astranaar", name = "Astranaar", match = { "astranaar" } },
-	{ id = "auberdine", name = "Auberdine", match = { "auberdine" } },
-	{ id = "freewind", name = "Freewind Post", match = { "freewind post" } },
-	{ id = "camp_taurajo", name = "Camp Taurajo", match = { "camp taurajo" } },
-	{ id = "hammerfall", name = "Hammerfall", match = { "hammerfall" } },
-	{ id = "revantusk", name = "Revantusk Village", match = { "revantusk village" } },
-	{ id = "light_hope", name = "Light's Hope Chapel", match = { "light's hope chapel" } },
-	{ id = "cenarion_hold", name = "Cenarion Hold", match = { "cenarion hold" } },
-	{ id = "feathermoon", name = "Feathermoon Stronghold", match = { "feathermoon stronghold" } },
-	{ id = "nijels_point", name = "Nijel's Point", match = { "nijel's point" } },
-	{ id = "stonetalon_peak", name = "Stonetalon Peak", match = { "stonetalon peak" } },
-	{ id = "sun_rock", name = "Sun Rock Retreat", match = { "sun rock retreat" } },
-	{ id = "splintertree", name = "Splintertree Post", match = { "splintertree post" } },
-	{ id = "zorgtars", name = "Zoram'gar Outpost", match = { "zoram'gar outpost" } },
-	{ id = "thelsamar", name = "Thelsamar", match = { "thelsamar" } },
-	{ id = "refuge_pointe", name = "Refuge Pointe", match = { "refuge pointe" } },
-	{ id = "chillwind", name = "Chillwind Camp", match = { "chillwind camp" } },
-	{ id = "aerie_peak", name = "Aerie Peak", match = { "aerie peak" } },
+	-- Horde
+	{ id = "brill", name = "Brill", faction = "Horde", match = { "brill" } },
+	{ id = "sepulcher", name = "The Sepulcher", faction = "Horde", match = { "the sepulcher", "sepulcher" } },
+	{ id = "razor_hill", name = "Razor Hill", faction = "Horde", match = { "razor hill" } },
+	{ id = "senjin", name = "Sen'jin Village", faction = "Horde", match = { "sen'jin village" } },
+	{ id = "bloodhoof", name = "Bloodhoof Village", faction = "Horde", match = { "bloodhoof village" } },
+	{ id = "crossroads", name = "The Crossroads", faction = "Horde", match = { "the crossroads", "crossroads" } },
+	{ id = "camp_taurajo", name = "Camp Taurajo", faction = "Horde", match = { "camp taurajo" } },
+	{ id = "freewind", name = "Freewind Post", faction = "Horde", match = { "freewind post" } },
+	{ id = "sun_rock", name = "Sun Rock Retreat", faction = "Horde", match = { "sun rock retreat" } },
+	{ id = "splintertree", name = "Splintertree Post", faction = "Horde", match = { "splintertree post" } },
+	{ id = "zorgtars", name = "Zoram'gar Outpost", faction = "Horde", match = { "zoram'gar outpost" } },
+	{ id = "tarren_mill", name = "Tarren Mill", faction = "Horde", match = { "tarren mill" } },
+	{ id = "hammerfall", name = "Hammerfall", faction = "Horde", match = { "hammerfall" } },
+	{ id = "revantusk", name = "Revantusk Village", faction = "Horde", match = { "revantusk village" } },
+	{ id = "shadowprey", name = "Shadowprey Village", faction = "Horde", match = { "shadowprey village" } },
+	{ id = "camp_mojache", name = "Camp Mojache", faction = "Horde", match = { "camp mojache" } },
+	{ id = "brackenwall", name = "Brackenwall Village", faction = "Horde", match = { "brackenwall village" } },
+	{ id = "gromgol", name = "Grom'gol Base Camp", faction = "Horde", match = { "grom'gol base camp", "grom'gol" } },
+	{ id = "stonard", name = "Stonard", faction = "Horde", match = { "stonard" } },
+	{ id = "kargath", name = "Kargath", faction = "Horde", match = { "kargath" } },
+	{ id = "valormok", name = "Valormok", faction = "Horde", match = { "valormok" } },
+	{ id = "bloodvenom", name = "Bloodvenom Post", faction = "Horde", match = { "bloodvenom post" } },
+	-- Alliance
+	{ id = "goldshire", name = "Goldshire", faction = "Alliance", match = { "goldshire" } },
+	{ id = "kharanos", name = "Kharanos", faction = "Alliance", match = { "kharanos" } },
+	{ id = "dolanaar", name = "Dolanaar", faction = "Alliance", match = { "dolanaar" } },
+	{ id = "sentinel_hill", name = "Sentinel Hill", faction = "Alliance", match = { "sentinel hill" } },
+	{ id = "lakeshire", name = "Lakeshire", faction = "Alliance", match = { "lakeshire" } },
+	{ id = "darkshire", name = "Darkshire", faction = "Alliance", match = { "darkshire" } },
+	{ id = "menethil", name = "Menethil Harbor", faction = "Alliance", match = { "menethil harbor" } },
+	{ id = "thelsamar", name = "Thelsamar", faction = "Alliance", match = { "thelsamar" } },
+	{ id = "refuge_pointe", name = "Refuge Pointe", faction = "Alliance", match = { "refuge pointe" } },
+	{ id = "southshore", name = "Southshore", faction = "Alliance", match = { "southshore" } },
+	{ id = "aerie_peak", name = "Aerie Peak", faction = "Alliance", match = { "aerie peak" } },
+	{ id = "chillwind", name = "Chillwind Camp", faction = "Alliance", match = { "chillwind camp" } },
+	{ id = "astranaar", name = "Astranaar", faction = "Alliance", match = { "astranaar" } },
+	{ id = "auberdine", name = "Auberdine", faction = "Alliance", match = { "auberdine" } },
+	{ id = "stonetalon_peak", name = "Stonetalon Peak", faction = "Alliance", match = { "stonetalon peak" } },
+	{ id = "nijels_point", name = "Nijel's Point", faction = "Alliance", match = { "nijel's point" } },
+	{ id = "feathermoon", name = "Feathermoon Stronghold", faction = "Alliance", match = { "feathermoon stronghold" } },
+	{ id = "thalanaar", name = "Thalanaar", faction = "Alliance", match = { "thalanaar" } },
+	{ id = "theramore", name = "Theramore Isle", faction = "Alliance", match = { "theramore isle", "theramore" } },
+	{ id = "nethergarde", name = "Nethergarde Keep", faction = "Alliance", match = { "nethergarde keep" } },
+	{ id = "morgans_vigil", name = "Morgan's Vigil", faction = "Alliance", match = { "morgan's vigil" } },
+	{ id = "talrendis", name = "Talrendis Point", faction = "Alliance", match = { "talrendis point" } },
+	{ id = "talonbranch", name = "Talonbranch Glade", faction = "Alliance", match = { "talonbranch glade" } },
+	-- Neutral / shared hubs
+	{ id = "booty_bay", name = "Booty Bay", faction = "Neutral", match = { "booty bay" } },
+	{ id = "gadgetzan", name = "Gadgetzan", faction = "Neutral", match = { "gadgetzan" } },
+	{ id = "everlook", name = "Everlook", faction = "Neutral", match = { "everlook" } },
+	{ id = "ratchet", name = "Ratchet", faction = "Neutral", match = { "ratchet" } },
+	{ id = "light_hope", name = "Light's Hope Chapel", faction = "Neutral", match = { "light's hope chapel" } },
+	{ id = "cenarion_hold", name = "Cenarion Hold", faction = "Neutral", match = { "cenarion hold" } },
+	{ id = "thorium_point", name = "Thorium Point", faction = "Neutral", match = { "thorium point" } },
+	{ id = "marshals", name = "Marshal's Refuge", faction = "Neutral", match = { "marshal's refuge" } },
+	{ id = "flame_crest", name = "Flame Crest", faction = "Neutral", match = { "flame crest" } },
 }
 
 local DUNGEON_LOCATIONS = {
-	-- Classic
+	-- Classic Era complete set
 	{ id = "rfc", name = "Ragefire Chasm", match = { "ragefire chasm" } },
 	{ id = "wc", name = "Wailing Caverns", match = { "wailing caverns" } },
 	{ id = "deadmines", name = "The Deadmines", match = { "the deadmines", "deadmines" } },
@@ -1687,11 +896,52 @@ local RAID_LOCATIONS = {
 	{ id = "naxx", name = "Naxxramas", match = { "naxxramas" } },
 }
 
-local function NormName(s)
+function ns.NormName(s)
 	return strlower(strtrim(s or ""))
 end
 
-local function GetJumpContext()
+function ns.FrameIsShown(frame)
+	return frame and frame.IsShown and frame:IsShown()
+end
+
+function ns.TodayKey(offsetDays)
+	offsetDays = offsetDays or 0
+	local t = time() - (offsetDays * 86400)
+	return date("%Y-%m-%d", t)
+end
+
+function ns.NoteJumpDay()
+	local db = ns.EnsureDB()
+	if not db then
+		return 0
+	end
+	local key = ns.TodayKey(0)
+	db.jumpDayKeys[key] = true
+	local streak = 0
+	for i = 0, 60 do
+		if db.jumpDayKeys[ns.TodayKey(i)] then
+			streak = streak + 1
+		else
+			break
+		end
+	end
+	return streak
+end
+
+function ns.CountJumpDays()
+	local db = ns.DB()
+	if not db or type(db.jumpDayKeys) ~= "table" then
+		return 0
+	end
+	local n = 0
+	for _ in pairs(db.jumpDayKeys) do
+		n = n + 1
+	end
+	return n
+end
+
+function ns.GetJumpContext(extra)
+	extra = extra or {}
 	local zone = GetRealZoneText() or GetZoneText() or ""
 	local sub = GetSubZoneText() or ""
 	local mini = GetMinimapZoneText() or ""
@@ -1700,17 +950,31 @@ local function GetJumpContext()
 	instanceType = instanceType or "none"
 
 	local spots = {
-		NormName(zone),
-		NormName(sub),
-		NormName(mini),
+		ns.NormName(zone),
+		ns.NormName(sub),
+		ns.NormName(mini),
 	}
 
 	local function inPlace(...)
 		for i = 1, select("#", ...) do
-			local want = NormName(select(i, ...))
+			local want = ns.NormName(select(i, ...))
 			for _, spot in ipairs(spots) do
 				if spot ~= "" and spot == want then
 					return true
+				end
+			end
+		end
+		return false
+	end
+
+	local function spotContains(...)
+		for i = 1, select("#", ...) do
+			local needle = ns.NormName(select(i, ...))
+			if needle ~= "" then
+				for _, spot in ipairs(spots) do
+					if spot ~= "" and spot:find(needle, 1, true) then
+						return true
+					end
 				end
 			end
 		end
@@ -1733,6 +997,25 @@ local function GetJumpContext()
 		return false
 	end
 
+	local hour = 12
+	if GetGameTime then
+		local h = GetGameTime()
+		if type(h) == "number" then
+			hour = h
+		end
+	end
+
+	local pvpType = nil
+	if GetZonePVPInfo then
+		pvpType = GetZonePVPInfo()
+	end
+
+	local indoors = false
+	if IsIndoors then
+		local ok, v = pcall(IsIndoors)
+		indoors = ok and v and true or false
+	end
+
 	return {
 		zone = zone,
 		sub = sub,
@@ -1740,14 +1023,49 @@ local function GetJumpContext()
 		mapID = mapID,
 		instanceType = instanceType,
 		inPlace = inPlace,
+		spotContains = spotContains,
 		matchesLocation = matchesLocation,
+		idleGap = tonumber(extra.idleGap) or 0,
+		dayStreak = tonumber(extra.dayStreak) or 0,
+		combat = UnitAffectingCombat and UnitAffectingCombat("player") or false,
+		mounted = IsMounted and IsMounted() or false,
+		swimming = (IsSwimming and IsSwimming()) or (IsSubmerged and IsSubmerged()) or false,
+		dead = UnitIsDeadOrGhost and UnitIsDeadOrGhost("player") or false,
+		ghost = UnitIsGhost and UnitIsGhost("player") or false,
+		taxi = UnitOnTaxi and UnitOnTaxi("player") or false,
+		grouped = IsInGroup and IsInGroup() or false,
+		raid = IsInRaid and IsInRaid() or false,
+		camp = ns.HasCampBenefit and ns.HasCampBenefit() or false,
+		hour = hour,
+		night = hour >= 21 or hour < 5,
+		pvpType = pvpType,
+		contested = pvpType == "contested",
+		indoors = indoors,
+		atAuction = ns.FrameIsShown(AuctionFrame) or ns.FrameIsShown(AuctionHouseFrame),
+		atMail = ns.FrameIsShown(MailFrame),
+		atTrainer = ns.FrameIsShown(ClassTrainerFrame) or ns.FrameIsShown(TrainerFrame),
+		onTransport = spotContains(
+			"deck",
+			"the thundercaller",
+			"the purple princess",
+			"the maiden's fancy",
+			"the bravery",
+			"the lady mehley",
+			"the moonspray",
+			"zee looting boat",
+			"the maiden's virtue",
+			"zeppelin"
+		) or inPlace("the thundercaller", "the purple princess", "the maiden's fancy"),
+		gmIsland = inPlace("gm island", "designer island") or spotContains("gm island"),
 	}
 end
 
-local function MakeLocationFeat(loc, category, requireInstanceType)
+function ns.MakeLocationFeat(loc, baseCategory, requireInstanceType)
 	return {
 		id = loc.id,
-		category = category,
+		baseCategory = baseCategory,
+		faction = loc.faction,
+		isLocation = true,
 		name = loc.name,
 		desc = "Jump once in " .. loc.name .. ".",
 		test = function(ctx)
@@ -1759,44 +1077,250 @@ local function MakeLocationFeat(loc, category, requireInstanceType)
 	}
 end
 
+function ns.MakeFeat(id, baseCategory, name, desc, test)
+	return {
+		id = id,
+		baseCategory = baseCategory,
+		name = name,
+		desc = desc,
+		test = test,
+	}
+end
+
 local ACHIEVEMENTS = {}
+
+function ns.AllLocationFeatsEarned(baseCategory)
+	local db = ns.DB()
+	if not db or type(db.achievements) ~= "table" then
+		return false
+	end
+	local any = false
+	for _, ach in ipairs(ACHIEVEMENTS) do
+		if ach.isLocation and ns.ResolveFeatCategory(ach) == baseCategory then
+			any = true
+			if not db.achievements[ach.id] then
+				return false
+			end
+		end
+	end
+	return any
+end
+
 for _, loc in ipairs(CITY_LOCATIONS) do
-	ACHIEVEMENTS[#ACHIEVEMENTS + 1] = MakeLocationFeat(loc, "city")
+	ACHIEVEMENTS[#ACHIEVEMENTS + 1] = ns.MakeLocationFeat(loc, "city")
 end
 for _, loc in ipairs(TOWN_LOCATIONS) do
-	ACHIEVEMENTS[#ACHIEVEMENTS + 1] = MakeLocationFeat(loc, "town")
+	ACHIEVEMENTS[#ACHIEVEMENTS + 1] = ns.MakeLocationFeat(loc, "town")
 end
 for _, loc in ipairs(DUNGEON_LOCATIONS) do
-	ACHIEVEMENTS[#ACHIEVEMENTS + 1] = MakeLocationFeat(loc, "dungeon", "party")
+	ACHIEVEMENTS[#ACHIEVEMENTS + 1] = ns.MakeLocationFeat(loc, "dungeon", "party")
 end
 for _, loc in ipairs(RAID_LOCATIONS) do
-	ACHIEVEMENTS[#ACHIEVEMENTS + 1] = MakeLocationFeat(loc, "raid", "raid")
+	ACHIEVEMENTS[#ACHIEVEMENTS + 1] = ns.MakeLocationFeat(loc, "raid", "raid")
+end
+
+-- Non-location feats (habit / style / travel / social / collection / oddities).
+do
+	local function add(id, cat, name, desc, test)
+		ACHIEVEMENTS[#ACHIEVEMENTS + 1] = ns.MakeFeat(id, cat, name, desc, test)
+	end
+
+	-- Milestone / habit
+	add("jumps_100", "milestone", "Century Hopper", "Reach 100 lifetime jumps.", function()
+		return ns.DB().jumps >= 100
+	end)
+	add("jumps_1000", "milestone", "Thousand Hops", "Reach 1,000 lifetime jumps.", function()
+		return ns.DB().jumps >= 1000
+	end)
+	add("jumps_10000", "milestone", "Leg Day Legend", "Reach 10,000 lifetime jumps.", function()
+		return ns.DB().jumps >= 10000
+	end)
+	add("level_10", "milestone", "Getting Air", "Reach Jump Habit level 10.", function()
+		return ns.GetLevel(ns.DB().xp) >= 10
+	end)
+	add("level_40", "milestone", "Serious Bounce", "Reach Jump Habit level 40.", function()
+		return ns.GetLevel(ns.DB().xp) >= 40
+	end)
+	add("level_70", "milestone", "Vertical Authority", "Reach Jump Habit level 70.", function()
+		return ns.GetLevel(ns.DB().xp) >= 70
+	end)
+	add("level_99", "milestone", "Habit Maxed", "Reach Jump Habit level 99.", function()
+		return ns.GetLevel(ns.DB().xp) >= 99
+	end)
+	add("streak_3", "milestone", "Three-Day Tick", "Jump on 3 consecutive calendar days.", function(ctx)
+		return (ctx.dayStreak or 0) >= 3
+	end)
+	add("streak_7", "milestone", "Weekly Legs", "Jump on 7 consecutive calendar days.", function(ctx)
+		return (ctx.dayStreak or 0) >= 7
+	end)
+	add("streak_30", "milestone", "Monthly Devotion", "Jump on 30 consecutive calendar days.", function(ctx)
+		return (ctx.dayStreak or 0) >= 30
+	end)
+	add("session_50", "milestone", "Warm-Up Crush", "Make 50 jumps in a single session.", function()
+		return sessionJumps >= 50
+	end)
+	add("session_200", "milestone", "Session Savage", "Make 200 jumps in a single session.", function()
+		return sessionJumps >= 200
+	end)
+
+	-- Style / situation
+	add("camp_jump", "style", "Camp Cadet", "Jump while Camp Benefit is active.", function(ctx)
+		return ctx.camp
+	end)
+	add("combat_jump", "style", "Fight Hop", "Jump while in combat.", function(ctx)
+		return ctx.combat
+	end)
+	add("mounted_jump", "style", "Saddle Skip", "Jump while mounted.", function(ctx)
+		return ctx.mounted
+	end)
+	add("swim_jump", "style", "Splash Hop", "Jump while swimming.", function(ctx)
+		return ctx.swimming
+	end)
+	add("indoor_jump", "style", "Ceiling Tester", "Jump while indoors.", function(ctx)
+		return ctx.indoors
+	end)
+	add("night_jump", "style", "Midnight Bounce", "Jump between 21:00 and 05:00.", function(ctx)
+		return ctx.night
+	end)
+
+	-- Travel / risk
+	add("taxi_jump", "travel", "Bird Brain", "Jump while on a flight path.", function(ctx)
+		return ctx.taxi
+	end)
+	add("transport_jump", "travel", "Deck Cadet", "Jump on a boat or zeppelin deck.", function(ctx)
+		return ctx.onTransport
+	end)
+	add("contested_jump", "travel", "Orange Zone", "Jump in a contested PvP zone.", function(ctx)
+		return ctx.contested
+	end)
+	add("ghost_jump", "travel", "Spectral Skip", "Jump while dead or as a ghost.", function(ctx)
+		return ctx.dead or ctx.ghost
+	end)
+
+	-- Social
+	add("party_jump", "social", "Group Bounce", "Jump while in a party.", function(ctx)
+		return ctx.grouped and not ctx.raid
+	end)
+	add("raid_jump", "social", "Raid Hop", "Jump while in a raid group.", function(ctx)
+		return ctx.raid
+	end)
+	add("announce_5", "social", "Guild Flex", "Announce your Jump Habit status 5 times.", function()
+		return (ns.DB().announceCount or 0) >= 5
+	end)
+	add("announce_25", "social", "Town Crier", "Announce your Jump Habit status 25 times.", function()
+		return (ns.DB().announceCount or 0) >= 25
+	end)
+	add("ajh_peers", "social", "Shared Habit", "Jump while 2+ AJH players are on your guild board.", function()
+		local db = ns.DB()
+		if type(db.board) ~= "table" then
+			return false
+		end
+		local n = 0
+		for _ in pairs(db.board) do
+			n = n + 1
+			if n >= 2 then
+				return true
+			end
+		end
+		return false
+	end)
+
+	-- Collection / meta (after location feats so same-jump unlocks cascade)
+	add("meta_capitals", "collection", "Capital Circuit", "Jump in every capital city (yours and theirs).", function()
+		for _, loc in ipairs(CITY_LOCATIONS) do
+			if not ns.DB().achievements[loc.id] then
+				return false
+			end
+		end
+		return true
+	end)
+	add("meta_towns_friendly", "collection", "Hometown Hero", "Complete every friendly/neutral Town Jumper feat.", function()
+		return ns.AllLocationFeatsEarned("town")
+	end)
+	add("meta_hostile", "collection", "Enemy Tourism", "Complete every Hostile Territory feat.", function()
+		return ns.AllLocationFeatsEarned("hostile")
+	end)
+	add("meta_dungeons", "collection", "Dungeon Tourist", "Jump in every dungeon.", function()
+		return ns.AllLocationFeatsEarned("dungeon")
+	end)
+	add("meta_raids", "collection", "Raid Tourist", "Jump in every raid.", function()
+		return ns.AllLocationFeatsEarned("raid")
+	end)
+
+	-- Oddities
+	add("ah_jump", "oddity", "Bid High", "Jump with the auction house open.", function(ctx)
+		return ctx.atAuction
+	end)
+	add("mail_jump", "oddity", "Postage Due", "Jump with the mailbox open.", function(ctx)
+		return ctx.atMail
+	end)
+	add("trainer_jump", "oddity", "Class Is in Session", "Jump with a class trainer open.", function(ctx)
+		return ctx.atTrainer
+	end)
+	add("gm_island", "oddity", "Wrong Neighborhood", "Jump on GM Island (if you somehow get there).", function(ctx)
+		return ctx.gmIsland
+	end)
+	add("idle_30", "oddity", "Archindula Noticed", "Jump after 30+ minutes without jumping.", function(ctx)
+		return (ctx.idleGap or 0) >= 1800
+	end)
 end
 
 local FEAT_CATEGORIES = {
-	{ id = "city", name = "City Jumper", desc = "Capital cities." },
-	{ id = "town", name = "Town Jumper", desc = "Towns, villages, and outposts." },
+	{ id = "city", name = "City Jumper", desc = "Your faction's capital cities." },
+	{ id = "town", name = "Town Jumper", desc = "Friendly and neutral towns." },
+	{ id = "hostile", name = "Hostile Territory", desc = "Enemy cities and towns." },
 	{ id = "dungeon", name = "Dungeon Jumper", desc = "Every dungeon." },
 	{ id = "raid", name = "Raid Jumper", desc = "Every raid." },
+	{ id = "milestone", name = "Habit Milestones", desc = "Jumps, levels, streaks, sessions." },
+	{ id = "style", name = "Style Points", desc = "Camp, combat, mount, swim, indoors, night." },
+	{ id = "travel", name = "Travel & Risk", desc = "Taxi, boats, contested, ghost." },
+	{ id = "social", name = "Social Hops", desc = "Party, raid, announces, guild board." },
+	{ id = "collection", name = "Collections", desc = "Finish whole location categories." },
+	{ id = "oddity", name = "Oddities", desc = "AH, mail, trainer, GM Island, idle." },
 }
 
-local function GetFeatsInCategory(categoryId)
+function ns.GetPlayerFaction()
+	local fac = UnitFactionGroup and UnitFactionGroup("player")
+	if fac == "Alliance" or fac == "Horde" then
+		return fac
+	end
+	return nil
+end
+
+-- City/town feats for the opposite faction show under Hostile; Neutral stays in Town.
+function ns.ResolveFeatCategory(ach)
+	local base = ach.baseCategory or ach.category
+	if base ~= "city" and base ~= "town" then
+		return base
+	end
+	local fac = ach.faction
+	if not fac or fac == "Neutral" then
+		return base
+	end
+	local mine = ns.GetPlayerFaction()
+	if mine and fac ~= mine then
+		return "hostile"
+	end
+	return base
+end
+
+function ns.GetFeatsInCategory(categoryId)
 	local list = {}
 	for _, ach in ipairs(ACHIEVEMENTS) do
-		if ach.category == categoryId then
+		if ns.ResolveFeatCategory(ach) == categoryId then
 			list[#list + 1] = ach
 		end
 	end
 	return list
 end
 
-local function CountCategoryProgress(categoryId)
+function ns.CountCategoryProgress(categoryId)
 	local total, earned = 0, 0
-	EnsureDB()
+	ns.EnsureDB()
 	for _, ach in ipairs(ACHIEVEMENTS) do
-		if ach.category == categoryId then
+		if ns.ResolveFeatCategory(ach) == categoryId then
 			total = total + 1
-			if AJHDB.achievements[ach.id] then
+			if ns.DB().achievements[ach.id] then
 				earned = earned + 1
 			end
 		end
@@ -1827,29 +1351,25 @@ local PRIDE_LINES = {
 -- Forward declarations (assigned later)
 local panel
 local activeTab = "habit"
-local BroadcastScore
-local UpdateAchievements
-local UpdateLeaderboard
-local UpdateJumpXPBar
-
 local toastFrame
 local toastQueue = {}
 local toastBusy = false
 
-local function SoundsAllowed()
+function ns.SoundsAllowed()
 	-- Before DB exists, allow sounds (defaults are on).
-	if type(AJHDB) ~= "table" then
+	local db = ns.DB()
+	if type(db) ~= "table" then
 		return true
 	end
-	if AJHDB.soundsEnabled == false then
+	if db.soundsEnabled == false then
 		return false
 	end
-	local vol = ToNumberOr(AJHDB.soundVolume, 100) or 100
+	local vol = ns.ToNumberOr(db.soundVolume, 100) or 100
 	return vol > 0
 end
 
-local function PlayAchievementSound()
-	if not SoundsAllowed() then
+function ns.PlayAchievementSound()
+	if not ns.SoundsAllowed() then
 		return
 	end
 	-- Same fanfare as character level-up.
@@ -1867,7 +1387,7 @@ local function PlayAchievementSound()
 	end
 end
 
-local function EnsureToastFrame()
+function ns.EnsureToastFrame()
 	if toastFrame then
 		return toastFrame
 	end
@@ -1879,6 +1399,7 @@ local function EnsureToastFrame()
 	f:SetFrameLevel(200)
 	f:Hide()
 	f:SetAlpha(0)
+	f:SetScale(1)
 
 	local function GoldLine(anchor, y)
 		local line = f:CreateTexture(nil, "ARTWORK")
@@ -1903,6 +1424,10 @@ local function EnsureToastFrame()
 		title:SetFontObject(QuestFont_Super_Huge)
 	end
 	title:SetTextScale(1.25)
+	if title.SetShadowOffset then
+		title:SetShadowOffset(2, -2)
+		title:SetShadowColor(0, 0, 0, 0.85)
+	end
 	f.title = title
 
 	local pride = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
@@ -1917,7 +1442,7 @@ local function EnsureToastFrame()
 	return f
 end
 
-local function ShowNextToast()
+function ns.ShowNextToast()
 	if toastBusy then
 		return
 	end
@@ -1927,58 +1452,55 @@ local function ShowNextToast()
 	end
 
 	toastBusy = true
-	local f = EnsureToastFrame()
+	local f = ns.EnsureToastFrame()
 	f.banner:SetText(toast.banner or "FEAT UNLOCKED")
 	f.title:SetText(toast.name or "")
 	f.pride:SetText(PRIDE_LINES[math.random(1, #PRIDE_LINES)])
 
-	PlayAchievementSound()
+	ns.PlayAchievementSound()
 
 	f:Show()
 	f:SetAlpha(0)
-	f:SetScale(0.85)
 
 	local elapsed = 0
-	local fadeIn = 0.45
+	local fadeIn = 0.35
 	local holdUntil = 7.0
-	local fadeOut = 1.5
+	local fadeOut = 1.25
 	local total = holdUntil + fadeOut
 
+	-- Alpha only ? SetScale every frame forces full layout and looks jumpy.
 	f:SetScript("OnUpdate", function(self, dt)
 		elapsed = elapsed + dt
 		if elapsed < fadeIn then
-			local t = elapsed / fadeIn
-			self:SetAlpha(t)
-			self:SetScale(0.88 + 0.12 * t)
+			self:SetAlpha(elapsed / fadeIn)
 		elseif elapsed < holdUntil then
 			self:SetAlpha(1)
-			self:SetScale(1)
 		elseif elapsed < total then
-			local t = (elapsed - holdUntil) / fadeOut
-			self:SetAlpha(1 - t)
+			self:SetAlpha(1 - ((elapsed - holdUntil) / fadeOut))
 		else
 			self:SetScript("OnUpdate", nil)
+			self:SetAlpha(0)
 			self:Hide()
 			toastBusy = false
-			ShowNextToast()
+			ns.ShowNextToast()
 		end
 	end)
 end
 
-local function QueueToast(toast)
+function ns.QueueToast(toast)
 	tinsert(toastQueue, toast)
-	ShowNextToast()
+	ns.ShowNextToast()
 end
 
-local function QueueAchievementToast(ach)
-	QueueToast({
+function ns.QueueAchievementToast(ach)
+	ns.QueueToast({
 		banner = "FEAT UNLOCKED",
 		name = ach.name,
 		desc = ach.desc,
 	})
 end
 
-local function AnnounceLevelUp(newLevel)
+function ns.AnnounceLevelUp(newLevel)
 	DEFAULT_CHAT_FRAME:AddMessage(string.format(
 		"|cff88ff88AJH:|r Congratulations! Your Jump Habit is now level %d.",
 		newLevel
@@ -1992,29 +1514,29 @@ local function AnnounceLevelUp(newLevel)
 		detail = PRIDE_LINES[math.random(1, #PRIDE_LINES)]
 	end
 
-	QueueToast({
+	ns.QueueToast({
 		banner = "YOUR JUMP HABIT",
 		name = string.format("IS NOW LEVEL %d!", newLevel),
 		desc = detail,
 	})
 end
 
-local function GetAchievementMask()
+function ns.GetAchievementMask()
 	-- Legacy bitmask for older peers. Cap at 31 bits so "%d" / C int paths
 	-- never overflow (location feats alone exceed 32/53-bit masks).
-	EnsureDB()
+	ns.EnsureDB()
 	local mask = 0
 	local limit = math.min(#ACHIEVEMENTS, 31)
 	for i = 1, limit do
 		local ach = ACHIEVEMENTS[i]
-		if ach and AJHDB.achievements[ach.id] then
+		if ach and ns.DB().achievements[ach.id] then
 			mask = mask + (2 ^ (i - 1))
 		end
 	end
 	return mask
 end
 
-local function CountAchievementsFromMask(mask)
+function ns.CountAchievementsFromMask(mask)
 	mask = tonumber(mask) or 0
 	local n = 0
 	local limit = math.min(#ACHIEVEMENTS, 31)
@@ -2027,50 +1549,50 @@ local function CountAchievementsFromMask(mask)
 	return n
 end
 
-local function CountOwnAchievements()
-	EnsureDB()
+function ns.CountOwnAchievements()
+	ns.EnsureDB()
 	local n = 0
 	for _, ach in ipairs(ACHIEVEMENTS) do
-		if AJHDB.achievements[ach.id] then
+		if ns.DB().achievements[ach.id] then
 			n = n + 1
 		end
 	end
 	return n
 end
 
-local function UnlockAchievement(ach)
-	EnsureDB()
-	if AJHDB.achievements[ach.id] then
+function ns.UnlockAchievement(ach)
+	ns.EnsureDB()
+	if ns.DB().achievements[ach.id] then
 		return false
 	end
 
-	AJHDB.achievements[ach.id] = time()
-	CommitFloor()
+	ns.DB().achievements[ach.id] = time()
 	DEFAULT_CHAT_FRAME:AddMessage(string.format(
 		"|cff88ff88AJH:|r Feat unlocked: |cffffffff%s|r - %s",
 		ach.name,
 		ach.desc
 	))
 
-	QueueAchievementToast(ach)
+	ns.QueueAchievementToast(ach)
 
-	if AJHDB.autoAnnounce ~= false and IsInGuild() then
+	if ns.DB().autoAnnounce and IsInGuild() then
 		SendChatMessage(
 			string.format("Jump Habit Feat: %s - %s", ach.name, ach.desc),
 			"GUILD"
 		)
 	end
 
-	BroadcastScore()
+	ns.BroadcastScore()
 	return true
 end
 
-local function CheckAchievementsOnJump()
-	local ctx = GetJumpContext()
+function ns.CheckAchievementsOnJump(extra)
+	ns.EnsureDB()
+	local ctx = ns.GetJumpContext(extra)
 	local earned = false
 	for _, ach in ipairs(ACHIEVEMENTS) do
-		if not AJHDB.achievements[ach.id] and ach.test(ctx) then
-			if UnlockAchievement(ach) then
+		if not ns.DB().achievements[ach.id] and ach.test(ctx) then
+			if ns.UnlockAchievement(ach) then
 				earned = true
 			end
 		end
@@ -2078,16 +1600,22 @@ local function CheckAchievementsOnJump()
 	return earned
 end
 
-local function ResetAchievements()
-	EnsureDB()
-	AJHDB.achievements = {}
-	BroadcastScore()
+function ns.CheckAchievementsGeneral()
+	return ns.CheckAchievementsOnJump({
+		dayStreak = ns.CountJumpDays() > 0 and ns.NoteJumpDay() or 0,
+	})
+end
+
+function ns.ResetAchievements()
+	ns.EnsureDB()
+	ns.DB().achievements = {}
+	ns.BroadcastScore()
 	DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH:|r Feats reset for testing.")
 	if panel and panel:IsShown() then
 		if activeTab == "achieves" then
-			UpdateAchievements()
+			ns.UpdateAchievements()
 		elseif activeTab == "guild" then
-			UpdateLeaderboard()
+			ns.UpdateLeaderboard()
 		end
 	end
 end
@@ -2100,75 +1628,87 @@ local ui = {
 	achRows = {},
 	featCatRows = {},
 	featView = "categories", -- "categories" or a FEAT_CATEGORIES id
-	habitView = "main", -- "main" or "stats"
+	statsView = "main", -- "main" or "levels"
 }
 local lastGuildReply = 0
 local jumpXPBar
+-- Movable HUD bar only. Habit dialog bar uses HABIT_PANEL_XP_BAR_HEIGHT.
 local JUMP_XP_BAR_HEIGHT = 14
+local HABIT_PANEL_XP_BAR_HEIGHT = 22
 
--- Session statistics (not SavedVariables), except playTime / sessionJumpHigh in AJHDB.
-local sessionStartTime = 0
-local sessionJumps = 0
-local lastAcceptedJumpTime = 0
+-- Session statistics (not SavedVariables), except playTime / sessionJumpHigh in AJHSaved.
+-- sessionJumps / lastAcceptedJumpTime / sessionStartTime declared near top of file.
 local JUMP_TIME_RING_SIZE = 200
 local jumpTimeRing = {}
 local jumpTimeRingCount = 0
 local jumpTimeRingNext = 1
--- Seconds of play already credited into AJHDB.playTime this login.
+-- Seconds of play already credited into ns.DB().playTime this login.
 local playTimeFlushed = 0
 local playTimeTicker
 -- Attributed active time per accepted jump (matches jump cooldown cadence).
 local JUMP_ACTIVITY_SEC = 0.8
 
-local function EnsureSessionClock()
+function ns.EnsureSessionClock()
 	if sessionStartTime <= 0 then
 		sessionStartTime = GetTime()
 	end
 end
 
-local function CurrentSessionElapsed()
-	EnsureSessionClock()
+function ns.CurrentSessionElapsed()
+	ns.EnsureSessionClock()
 	return math.max(0, GetTime() - sessionStartTime)
 end
 
-local function FlushPlayTime()
-	EnsureDB()
-	local elapsed = CurrentSessionElapsed()
+function ns.FlushPlayTime()
+	local db = ns.EnsureDB()
+	if not db then
+		return
+	end
+	local elapsed = ns.CurrentSessionElapsed()
 	local delta = elapsed - playTimeFlushed
 	if delta > 0 then
-		AJHDB.playTime = (ToNumberOr(AJHDB.playTime, 0) or 0) + delta
+		db.playTime = (ns.ToNumberOr(db.playTime, 0) or 0) + delta
 		playTimeFlushed = elapsed
 	end
 end
 
-local function LifetimePlayTime()
-	EnsureDB()
-	FlushPlayTime()
-	return ToNumberOr(AJHDB.playTime, 0) or 0
+function ns.LifetimePlayTime()
+	local db = ns.EnsureDB()
+	if not db then
+		return 0
+	end
+	ns.FlushPlayTime()
+	return ns.ToNumberOr(db.playTime, 0) or 0
 end
 
-local function LifetimeJumpActivityTime()
-	EnsureDB()
-	return ToNumberOr(AJHDB.jumpActivityTime, 0) or 0
+function ns.LifetimeJumpActivityTime()
+	local db = ns.EnsureDB()
+	if not db then
+		return 0
+	end
+	return ns.ToNumberOr(db.jumpActivityTime, 0) or 0
 end
 
-local function NoteJumpActivity()
-	EnsureDB()
-	FlushPlayTime()
-	AJHDB.jumpActivityTime = (ToNumberOr(AJHDB.jumpActivityTime, 0) or 0) + JUMP_ACTIVITY_SEC
+function ns.NoteJumpActivity()
+	local db = ns.EnsureDB()
+	if not db then
+		return
+	end
+	ns.FlushPlayTime()
+	db.jumpActivityTime = (ns.ToNumberOr(db.jumpActivityTime, 0) or 0) + JUMP_ACTIVITY_SEC
 end
 
-local function FormatJumpIdlePct(jumpSec, totalSec)
+function ns.FormatJumpIdlePct(jumpSec, totalSec)
 	if not totalSec or totalSec <= 0 then
-		return "—"
+		return "?"
 	end
 	local jumpPct = math.min(100, (jumpSec / totalSec) * 100)
 	local idlePct = math.max(0, 100 - jumpPct)
-	return string.format("%.0f%% jumping · %.0f%% idle", jumpPct, idlePct)
+	return string.format("%.0f%% jumping ? %.0f%% idle", jumpPct, idlePct)
 end
 
-local function RecordSessionJump(now)
-	EnsureSessionClock()
+function ns.RecordSessionJump(now)
+	ns.EnsureSessionClock()
 	sessionJumps = sessionJumps + 1
 	lastAcceptedJumpTime = now
 	jumpTimeRing[jumpTimeRingNext] = now
@@ -2178,17 +1718,15 @@ local function RecordSessionJump(now)
 	end
 end
 
-local function NoteSessionJumpHigh()
-	EnsureDB()
-	local high = AJHDB.sessionJumpHigh or 0
+function ns.NoteSessionJumpHigh()
+	ns.EnsureDB()
+	local high = ns.DB().sessionJumpHigh or 0
 	if sessionJumps > high then
-		AJHDB.sessionJumpHigh = sessionJumps
-		CommitFloor()
-		PersistProgressMirror()
+		ns.DB().sessionJumpHigh = sessionJumps
 	end
 end
 
-local function CountJumpsInWindow(windowSec)
+function ns.CountJumpsInWindow(windowSec)
 	local cutoff = GetTime() - windowSec
 	local n = 0
 	for i = 1, jumpTimeRingCount do
@@ -2200,7 +1738,7 @@ local function CountJumpsInWindow(windowSec)
 	return n
 end
 
-local function FormatDuration(seconds)
+function ns.FormatDuration(seconds)
 	seconds = math.max(0, math.floor(seconds or 0))
 	local h = math.floor(seconds / 3600)
 	local m = math.floor((seconds % 3600) / 60)
@@ -2215,56 +1753,79 @@ end
 
 local statsTicker
 
-local function StopStatsTicker()
+function ns.StopStatsTicker()
 	if statsTicker then
 		statsTicker:Cancel()
 		statsTicker = nil
 	end
 end
 
-local function StartStatsTicker()
-	StopStatsTicker()
+function ns.StartStatsTicker()
+	ns.StopStatsTicker()
 	if not (C_Timer and C_Timer.NewTicker) then
 		return
 	end
 	statsTicker = C_Timer.NewTicker(1, function()
-		if not panel or not panel:IsShown() or activeTab ~= "habit" or ui.habitView ~= "stats" then
-			StopStatsTicker()
+		if not panel or not panel:IsShown() or activeTab ~= "stats" or ui.statsView ~= "main" then
+			ns.StopStatsTicker()
 			return
 		end
 		panel:Update()
 	end)
 end
 
-local function SyncStatsTicker()
-	if panel and panel:IsShown() and activeTab == "habit" and ui.habitView == "stats" then
+function ns.SyncStatsTicker()
+	if panel and panel:IsShown() and activeTab == "stats" and ui.statsView == "main" then
 		if not statsTicker then
-			StartStatsTicker()
+			ns.StartStatsTicker()
 		end
 	else
-		StopStatsTicker()
+		ns.StopStatsTicker()
 	end
 end
 
-local function ShowHabitView(view)
-	ui.habitView = view or "main"
-	if ui.habitMain then
-		ui.habitMain:SetShown(ui.habitView == "main")
+function ns.ShowStatsView(view)
+	ui.statsView = view or "main"
+	if ui.statsMain then
+		ui.statsMain:SetShown(ui.statsView == "main")
 	end
-	if ui.habitStats then
-		ui.habitStats:SetShown(ui.habitView == "stats")
+	if ui.statsLevels then
+		ui.statsLevels:SetShown(ui.statsView == "levels")
 	end
-	SyncStatsTicker()
+	if ui.statsView == "levels" and ui.levelScroll then
+		ns.EnsureDB()
+		local level = ns.GetLevel(ns.DB().xp)
+		local function TryScroll(attempt)
+			if type(ns.ScrollLevelsToCurrent) ~= "function" then
+				return
+			end
+			local scroll = ui.levelScroll
+			if scroll and (scroll:GetHeight() or 0) > 0 then
+				ns.ScrollLevelsToCurrent(level)
+				return
+			end
+			if (attempt or 0) < 8 then
+				C_Timer.After(0.05, function()
+					TryScroll((attempt or 0) + 1)
+				end)
+			end
+		end
+		C_Timer.After(0, function()
+			TryScroll(0)
+		end)
+	end
+	ns.SyncStatsTicker()
 end
 
-local function IsEditModeActive()
+function ns.IsEditModeActive()
+	local LibEditMode = ns.GetLibEditMode()
 	if LibEditMode and LibEditMode.IsInEditMode then
 		return LibEditMode:IsInEditMode()
 	end
 	return EditModeManagerFrame and EditModeManagerFrame:IsShown()
 end
 
-local function TrySetAtlas(texture, atlas)
+function ns.TrySetAtlas(texture, atlas, useAtlasSize)
 	if not texture or not atlas then
 		return false
 	end
@@ -2274,13 +1835,16 @@ local function TrySetAtlas(texture, atlas)
 			return false
 		end
 	end
-	return pcall(texture.SetAtlas, texture, atlas, true)
+	if useAtlasSize == nil then
+		useAtlasSize = true
+	end
+	return pcall(texture.SetAtlas, texture, atlas, useAtlasSize)
 end
 
-local function MatchDefaultStatusBarWidth()
+function ns.MatchDefaultStatusBarWidth()
 	-- Use on-screen span (GetRight-GetLeft) so we match the visible XP / status
 	-- bar even when GetWidth() is stale, scaled, or a half-size fallback.
-	-- Do NOT fall back to MainMenuBar / UIParent — those are much wider than the
+	-- Do NOT fall back to MainMenuBar / UIParent ? those are much wider than the
 	-- XP bar, so a saved 50% looked like ~100% after /reload.
 	local function Span(frame)
 		if not frame then
@@ -2332,7 +1896,7 @@ local function MatchDefaultStatusBarWidth()
 	return 804
 end
 
-local function DefaultJumpXPBarOffsetY()
+function ns.DefaultJumpXPBarOffsetY()
 	local container = MainStatusTrackingBarContainer
 	if not container and StatusTrackingBarManager then
 		container = StatusTrackingBarManager.MainStatusTrackingBarContainer
@@ -2364,48 +1928,48 @@ local jumpXPBarDraft
 local jumpXPBarBaseline
 local jumpXPBarEditDirty = false
 
-local function CopyJumpXPBarState(src)
+function ns.CopyJumpXPBarState(src)
 	return {
 		shown = not not (src and src.shown),
 		point = (src and src.point) or JUMP_XP_BAR_DEFAULT.point,
-		x = ToNumberOr(src and src.x, JUMP_XP_BAR_DEFAULT.x) or JUMP_XP_BAR_DEFAULT.x,
-		y = ToNumberOr(src and src.y, JUMP_XP_BAR_DEFAULT.y) or JUMP_XP_BAR_DEFAULT.y,
-		widthPct = ToNumberOr(src and src.widthPct, JUMP_XP_BAR_DEFAULT.widthPct) or JUMP_XP_BAR_DEFAULT.widthPct,
+		x = ns.ToNumberOr(src and src.x, JUMP_XP_BAR_DEFAULT.x) or JUMP_XP_BAR_DEFAULT.x,
+		y = ns.ToNumberOr(src and src.y, JUMP_XP_BAR_DEFAULT.y) or JUMP_XP_BAR_DEFAULT.y,
+		widthPct = ns.ToNumberOr(src and src.widthPct, JUMP_XP_BAR_DEFAULT.widthPct) or JUMP_XP_BAR_DEFAULT.widthPct,
 		userPlaced = not not (src and src.userPlaced),
 	}
 end
 
-local function GetJumpXPBarSaved()
-	EnsureDB()
-	local barDB = AJHDB.jumpXPBar
+function ns.GetJumpXPBarSaved()
+	ns.EnsureDB()
+	local barDB = ns.DB().jumpXPBar
 	barDB.point = type(barDB.point) == "string" and barDB.point or JUMP_XP_BAR_DEFAULT.point
-	barDB.x = ToNumberOr(barDB.x, JUMP_XP_BAR_DEFAULT.x) or JUMP_XP_BAR_DEFAULT.x
-	barDB.y = ToNumberOr(barDB.y, JUMP_XP_BAR_DEFAULT.y) or JUMP_XP_BAR_DEFAULT.y
-	barDB.widthPct = ToNumberOr(barDB.widthPct, 100) or 100
+	barDB.x = ns.ToNumberOr(barDB.x, JUMP_XP_BAR_DEFAULT.x) or JUMP_XP_BAR_DEFAULT.x
+	barDB.y = ns.ToNumberOr(barDB.y, JUMP_XP_BAR_DEFAULT.y) or JUMP_XP_BAR_DEFAULT.y
+	barDB.widthPct = ns.ToNumberOr(barDB.widthPct, 100) or 100
 	if barDB.widthPct < 50 then
 		barDB.widthPct = 50
 	elseif barDB.widthPct > 100 then
 		barDB.widthPct = 100
 	end
 	barDB.shown = not not barDB.shown
-	AJHDB.showJumpXPBar = barDB.shown
+	ns.DB().showJumpXPBar = barDB.shown
 	return barDB
 end
 
-local function GetJumpXPBarState()
+function ns.GetJumpXPBarState()
 	if jumpXPBarDraft then
 		return jumpXPBarDraft
 	end
-	return GetJumpXPBarSaved()
+	return ns.GetJumpXPBarSaved()
 end
 
-local function ApplyJumpXPBarLayout(holder, state)
+function ns.ApplyJumpXPBarLayout(holder, state)
 	if not holder then
 		return
 	end
-	state = state or GetJumpXPBarState()
-	local full = MatchDefaultStatusBarWidth()
-	local widthPct = ToNumberOr(state.widthPct, 100) or 100
+	state = state or ns.GetJumpXPBarState()
+	local full = ns.MatchDefaultStatusBarWidth()
+	local widthPct = ns.ToNumberOr(state.widthPct, 100) or 100
 	if widthPct < 50 then
 		widthPct = 50
 	elseif widthPct > 100 then
@@ -2413,8 +1977,8 @@ local function ApplyJumpXPBarLayout(holder, state)
 	end
 	local width = full * (widthPct / 100)
 	local point = (type(state.point) == "string" and state.point) or "BOTTOM"
-	local x = ToNumberOr(state.x, 0) or 0
-	local y = ToNumberOr(state.y, 55) or 55
+	local x = ns.ToNumberOr(state.x, 0) or 0
+	local y = ns.ToNumberOr(state.y, 55) or 55
 	holder:SetSize(width, JUMP_XP_BAR_HEIGHT)
 	holder:ClearAllPoints()
 	holder:SetPoint(point, UIParent, point, x, y)
@@ -2423,25 +1987,25 @@ local function ApplyJumpXPBarLayout(holder, state)
 	end
 end
 
-local function RestoreJumpXPBarFromSaved()
+function ns.RestoreJumpXPBarFromSaved()
 	if not jumpXPBar then
 		return
 	end
-	JUMP_XP_BAR_DEFAULT.y = DefaultJumpXPBarOffsetY()
-	ApplyJumpXPBarLayout(jumpXPBar, GetJumpXPBarSaved())
-	UpdateJumpXPBar()
+	JUMP_XP_BAR_DEFAULT.y = ns.DefaultJumpXPBarOffsetY()
+	ns.ApplyJumpXPBarLayout(jumpXPBar, ns.GetJumpXPBarSaved())
+	ns.UpdateJumpXPBar()
 end
 
-local function CommitJumpXPBarState(state, opts)
-	EnsureDB()
-	state = state or GetJumpXPBarState()
+function ns.CommitJumpXPBarState(state, opts)
+	ns.EnsureDB()
+	state = state or ns.GetJumpXPBarState()
 	opts = opts or {}
-	local barDB = AJHDB.jumpXPBar
+	local barDB = ns.DB().jumpXPBar
 
 	-- Visibility always updates (hide button must work).
 	if state.shown ~= nil then
 		barDB.shown = not not state.shown
-		AJHDB.showJumpXPBar = barDB.shown
+		ns.DB().showJumpXPBar = barDB.shown
 	end
 
 	if opts.visibilityOnly then
@@ -2452,13 +2016,13 @@ local function CommitJumpXPBarState(state, opts)
 		shown = barDB.shown,
 		point = state.point or barDB.point or "BOTTOM",
 		x = tonumber(state.x)
-			or ToNumberOr(barDB.x, 0)
+			or ns.ToNumberOr(barDB.x, 0)
 			or 0,
 		y = tonumber(state.y)
-			or ToNumberOr(barDB.y, 55)
+			or ns.ToNumberOr(barDB.y, 55)
 			or 55,
 		widthPct = tonumber(state.widthPct)
-			or ToNumberOr(barDB.widthPct, 100)
+			or ns.ToNumberOr(barDB.widthPct, 100)
 			or 100,
 		userPlaced = not not (state.userPlaced or barDB.userPlaced),
 	}
@@ -2469,12 +2033,12 @@ local function CommitJumpXPBarState(state, opts)
 	end
 
 	-- Raise-only for position/size. Defaults cannot replace a customized bar.
-	if JumpXPBarLayoutScore(proposed) < JumpXPBarLayoutScore(barDB) then
+	if ns.JumpXPBarLayoutScore(proposed) < ns.JumpXPBarLayoutScore(barDB) then
 		return
 	end
 	-- Ignore non-userPlaced writes that look like Edit Mode defaults when we
 	-- already have any customized layout saved.
-	if not proposed.userPlaced and JumpXPBarLayoutScore(barDB) > 0 then
+	if not proposed.userPlaced and ns.JumpXPBarLayoutScore(barDB) > 0 then
 		return
 	end
 
@@ -2486,126 +2050,216 @@ local function CommitJumpXPBarState(state, opts)
 		barDB.userPlaced = true
 	end
 
-	if type(AJHDB.jumpXPBarLayouts) ~= "table" then
-		AJHDB.jumpXPBarLayouts = {}
+	if type(ns.DB().jumpXPBarLayouts) ~= "table" then
+		ns.DB().jumpXPBarLayouts = {}
 	end
 	-- Only snapshot into Edit Mode layouts when the player actually placed it.
 	if barDB.userPlaced then
 		local layoutName = "Modern"
+		local LibEditMode = ns.GetLibEditMode()
 		if LibEditMode and LibEditMode.GetActiveLayoutName then
 			layoutName = LibEditMode:GetActiveLayoutName() or layoutName
 		end
-		local layoutCopy = CopyJumpXPBarState(barDB)
-		local existingLayout = AJHDB.jumpXPBarLayouts[layoutName]
-		if JumpXPBarLayoutScore(layoutCopy) >= JumpXPBarLayoutScore(existingLayout) then
-			AJHDB.jumpXPBarLayouts[layoutName] = layoutCopy
+		local layoutCopy = ns.CopyJumpXPBarState(barDB)
+		local existingLayout = ns.DB().jumpXPBarLayouts[layoutName]
+		if ns.JumpXPBarLayoutScore(layoutCopy) >= ns.JumpXPBarLayoutScore(existingLayout) then
+			ns.DB().jumpXPBarLayouts[layoutName] = layoutCopy
 		end
 	end
 
-	if ToNumberOr(AJHDB.jumps, 0) > 0 then
-		CommitFloor()
-	end
 end
 
-local function PersistJumpXPBarDraft()
+function ns.PersistJumpXPBarDraft()
 	if jumpXPBarDraft and jumpXPBarEditDirty then
-		CommitJumpXPBarState(jumpXPBarDraft)
+		ns.CommitJumpXPBarState(jumpXPBarDraft)
 	end
 end
 
-local function MarkJumpXPBarEditDirty()
-	if not IsEditModeActive() then
+function ns.MarkJumpXPBarEditDirty()
+	if not ns.IsEditModeActive() then
 		return
 	end
 	jumpXPBarEditDirty = true
-	PersistJumpXPBarDraft()
+	ns.PersistJumpXPBarDraft()
 	if EditModeManagerFrame and EditModeManagerFrame.SetHasActiveChanges then
 		pcall(EditModeManagerFrame.SetHasActiveChanges, EditModeManagerFrame, true)
 	end
 end
 
-local function BeginJumpXPBarEditSession()
-	EnsureDB()
-	local saved = GetJumpXPBarSaved()
-	jumpXPBarBaseline = CopyJumpXPBarState(saved)
-	jumpXPBarDraft = CopyJumpXPBarState(saved)
+function ns.BeginJumpXPBarEditSession()
+	ns.EnsureDB()
+	local saved = ns.GetJumpXPBarSaved()
+	jumpXPBarBaseline = ns.CopyJumpXPBarState(saved)
+	jumpXPBarDraft = ns.CopyJumpXPBarState(saved)
 	jumpXPBarEditDirty = false
 end
 
-local function CommitJumpXPBarEditSession()
+function ns.CommitJumpXPBarEditSession()
 	if not jumpXPBarDraft then
 		return
 	end
 	if jumpXPBarEditDirty then
 		jumpXPBarDraft.shown = true
 		jumpXPBarDraft.userPlaced = true
-		CommitJumpXPBarState(jumpXPBarDraft)
+		ns.CommitJumpXPBarState(jumpXPBarDraft)
 	end
-	jumpXPBarBaseline = CopyJumpXPBarState(jumpXPBarDraft)
-	jumpXPBarDraft = CopyJumpXPBarState(jumpXPBarDraft)
+	jumpXPBarBaseline = ns.CopyJumpXPBarState(jumpXPBarDraft)
+	jumpXPBarDraft = ns.CopyJumpXPBarState(jumpXPBarDraft)
 	jumpXPBarEditDirty = false
-	UpdateJumpXPBar()
+	ns.UpdateJumpXPBar()
 end
 
-local function RevertJumpXPBarEditSession()
+function ns.RevertJumpXPBarEditSession()
 	if not jumpXPBarBaseline then
 		jumpXPBarDraft = nil
 		jumpXPBarEditDirty = false
 		return
 	end
-	jumpXPBarDraft = CopyJumpXPBarState(jumpXPBarBaseline)
+	jumpXPBarDraft = ns.CopyJumpXPBarState(jumpXPBarBaseline)
 	jumpXPBarEditDirty = false
 	if jumpXPBar then
-		ApplyJumpXPBarLayout(jumpXPBar, jumpXPBarDraft)
+		ns.ApplyJumpXPBarLayout(jumpXPBar, jumpXPBarDraft)
 	end
-	UpdateJumpXPBar()
+	ns.UpdateJumpXPBar()
 end
 
-local function EndJumpXPBarEditSession()
+function ns.EndJumpXPBarEditSession()
 	if jumpXPBarDraft and jumpXPBarEditDirty then
 		jumpXPBarDraft.shown = true
 		jumpXPBarDraft.userPlaced = true
-		CommitJumpXPBarState(jumpXPBarDraft)
+		ns.CommitJumpXPBarState(jumpXPBarDraft)
 	end
 	jumpXPBarDraft = nil
 	jumpXPBarBaseline = nil
 	jumpXPBarEditDirty = false
-	UpdateJumpXPBar()
+	ns.UpdateJumpXPBar()
 end
 
-local function UpdateJumpXPBarToggleLabel()
-	if not ui.jumpXPBarToggle then
-		return
+function ns.AnnounceStatus(channel)
+	ns.EnsureDB()
+	channel = string.upper(channel or "")
+	if channel == "GUILD" and not IsInGuild() then
+		DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH:|r You are not in a guild.")
+		return false
 	end
-	local state = GetJumpXPBarSaved()
-	if state.shown then
-		ui.jumpXPBarToggle:SetText("Hide XP Bar")
-	else
-		ui.jumpXPBarToggle:SetText("Show XP Bar")
+	if channel == "PARTY" and not (IsInGroup and IsInGroup()) then
+		DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH:|r You are not in a party.")
+		return false
+	end
+	local level = ns.GetLevel(ns.DB().xp)
+	local jumps = ns.DB().jumps
+	SendChatMessage(
+		string.format(
+			"Jump Habit: Level %d - %s jump%s",
+			level,
+			ns.FormatNumber(jumps),
+			jumps == 1 and "" or "s"
+		),
+		channel
+	)
+	ns.DB().announceCount = (ns.ToNumberOr(ns.DB().announceCount, 0) or 0) + 1
+	if ns.CheckAchievementsOnJump({ dayStreak = ns.NoteJumpDay() }) and panel and panel:IsShown() and activeTab == "achieves" then
+		ns.UpdateAchievements()
+	end
+	return true
+end
+
+local announceDialog
+
+function ns.HideAnnounceDialog()
+	if announceDialog then
+		announceDialog:Hide()
 	end
 end
 
-UpdateJumpXPBar = function()
-	EnsureDB()
-	UpdateJumpXPBarToggleLabel()
+function ns.ShowAnnounceDialog()
+	if not announceDialog then
+		local f = CreateFrame("Frame", "AJHAnnounceDialog", UIParent, BackdropTemplateMixin and "BackdropTemplate" or nil)
+		f:SetSize(280, 220)
+		f:SetPoint("CENTER")
+		f:SetFrameStrata("DIALOG")
+		f:SetFrameLevel(200)
+		f:EnableMouse(true)
+		f:SetMovable(true)
+		f:RegisterForDrag("LeftButton")
+		f:SetScript("OnDragStart", f.StartMoving)
+		f:SetScript("OnDragStop", f.StopMovingOrSizing)
+		if f.SetBackdrop then
+			f:SetBackdrop({
+				bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+				edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+				tile = true,
+				tileSize = 32,
+				edgeSize = 32,
+				insets = { left = 8, right = 8, top = 8, bottom = 8 },
+			})
+		end
+		local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+		title:SetPoint("TOP", 0, -18)
+		title:SetText("Announce Jump Habit")
+		title:SetTextColor(1, 0.82, 0)
+		local prompt = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		prompt:SetPoint("TOP", title, "BOTTOM", 0, -10)
+		prompt:SetText("Choose a channel:")
+
+		local prev = prompt
+		local function MakeChannelButton(label, channel)
+			local btn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+			btn:SetSize(160, 24)
+			btn:SetPoint("TOP", prev, "BOTTOM", 0, -10)
+			btn:SetText(label)
+			btn:SetScript("OnClick", function()
+				ns.AnnounceStatus(channel)
+				ns.HideAnnounceDialog()
+			end)
+			prev = btn
+			return btn
+		end
+
+		MakeChannelButton("Say", "SAY")
+		MakeChannelButton("Party", "PARTY")
+		MakeChannelButton("Guild", "GUILD")
+
+		local cancel = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+		cancel:SetSize(80, 24)
+		cancel:SetPoint("TOP", prev, "BOTTOM", 0, -14)
+		cancel:SetText("Cancel")
+		cancel:SetScript("OnClick", ns.HideAnnounceDialog)
+
+		tinsert(UISpecialFrames, "AJHAnnounceDialog")
+		announceDialog = f
+	end
+	announceDialog:Show()
+	announceDialog:Raise()
+end
+
+function ns.UpdateJumpXPBarToggleLabel()
+	if ui.jumpXPBarCheck then
+		ui.jumpXPBarCheck:SetChecked(not not ns.GetJumpXPBarSaved().shown)
+	end
+end
+
+function ns.UpdateJumpXPBar()
+	ns.EnsureDB()
+	ns.UpdateJumpXPBarToggleLabel()
 	if not jumpXPBar then
 		return
 	end
 
-	local state = GetJumpXPBarState()
-	local editing = IsEditModeActive()
+	local state = ns.GetJumpXPBarState()
+	local editing = ns.IsEditModeActive()
 	if not state.shown and not editing then
 		jumpXPBar:Hide()
 		return
 	end
 
 	if not jumpXPBar.isMoving then
-		ApplyJumpXPBarLayout(jumpXPBar, state)
+		ns.ApplyJumpXPBarLayout(jumpXPBar, state)
 	end
 
-	local xp = AJHDB.xp
-	local jumps = AJHDB.jumps
-	local level = GetLevel(xp)
+	local xp = ns.DB().xp
+	local jumps = ns.DB().jumps
+	local level = ns.GetLevel(xp)
 	local intoLevel, needed, remaining, pct
 
 	if level >= MAX_LEVEL then
@@ -2615,7 +2269,9 @@ UpdateJumpXPBar = function()
 		pct = 100
 		jumpXPBar.bar:SetMinMaxValues(0, 1)
 		jumpXPBar.bar:SetValue(1)
-		jumpXPBar.text:SetText(string.format("Level %d  MAX", level))
+		if jumpXPBar.text then
+			jumpXPBar.text:SetText(string.format("Level %d  MAX", level))
+		end
 	else
 		intoLevel = xp - xpForLevel[level]
 		needed = xpForLevel[level + 1] - xpForLevel[level]
@@ -2623,7 +2279,9 @@ UpdateJumpXPBar = function()
 		pct = needed > 0 and math.floor((intoLevel / needed) * 100 + 0.5) or 0
 		jumpXPBar.bar:SetMinMaxValues(0, needed)
 		jumpXPBar.bar:SetValue(intoLevel)
-		jumpXPBar.text:SetText(string.format("Level %d  %d%%", level, pct))
+		if jumpXPBar.text then
+			jumpXPBar.text:SetText(string.format("Level %d  %d%%", level, pct))
+		end
 	end
 
 	jumpXPBar.tipLevel = level
@@ -2632,6 +2290,7 @@ UpdateJumpXPBar = function()
 	jumpXPBar.tipRemaining = remaining
 	jumpXPBar.tipJumps = jumps
 	jumpXPBar.tipMax = level >= MAX_LEVEL
+	jumpXPBar.tipPct = pct
 
 	if editing and not state.shown then
 		jumpXPBar:SetAlpha(0.65)
@@ -2641,41 +2300,42 @@ UpdateJumpXPBar = function()
 	jumpXPBar:Show()
 end
 
-local function SetJumpXPBarShown(shown)
-	EnsureDB()
-	local state = GetJumpXPBarState()
+function ns.SetJumpXPBarShown(shown)
+	ns.EnsureDB()
+	local state = ns.GetJumpXPBarState()
 	state.shown = not not shown
-	-- Visibility only — never touch position/size (and never block hide).
-	CommitJumpXPBarState(state, { visibilityOnly = true })
+	-- Visibility only ? never touch position/size (and never block hide).
+	ns.CommitJumpXPBarState(state, { visibilityOnly = true })
 	if jumpXPBarDraft then
 		jumpXPBarDraft.shown = state.shown
 	end
-	UpdateJumpXPBar()
+	ns.UpdateJumpXPBar()
 end
 
-local function SetupJumpXPBarEditMode(holder)
+function ns.SetupJumpXPBarEditMode(holder)
+	local LibEditMode = ns.GetLibEditMode()
 	if holder.editModeReady or not LibEditMode then
 		return
 	end
 	holder.editModeReady = true
 	holder.editModeName = "Jump Habit XP Bar"
 
-	JUMP_XP_BAR_DEFAULT.y = DefaultJumpXPBarOffsetY()
+	JUMP_XP_BAR_DEFAULT.y = ns.DefaultJumpXPBarOffsetY()
 
 	LibEditMode:AddFrame(holder, function(frame, _layoutName, point, x, y)
 		-- Ignore spurious callbacks outside Edit Mode (would lock in defaults).
-		if not IsEditModeActive() then
-			ApplyJumpXPBarLayout(frame, GetJumpXPBarSaved())
+		if not ns.IsEditModeActive() then
+			ns.ApplyJumpXPBarLayout(frame, ns.GetJumpXPBarSaved())
 			return
 		end
-		local state = GetJumpXPBarState()
+		local state = ns.GetJumpXPBarState()
 		state.point, state.x, state.y = point, x, y
 		state.shown = true
 		state.userPlaced = true
 		if jumpXPBarDraft then
-			MarkJumpXPBarEditDirty()
+			ns.MarkJumpXPBarEditDirty()
 		else
-			CommitJumpXPBarState(state)
+			ns.CommitJumpXPBarState(state)
 		end
 		frame:ClearAllPoints()
 		frame:SetPoint(point, UIParent, point, x, y)
@@ -2694,45 +2354,45 @@ local function SetupJumpXPBarEditMode(holder)
 				return string.format("%d%%", value)
 			end,
 			get = function()
-				return GetJumpXPBarState().widthPct
+				return ns.GetJumpXPBarState().widthPct
 			end,
 			set = function(_layoutName, value, _fromReset)
-				if not IsEditModeActive() and not _fromReset then
+				if not ns.IsEditModeActive() and not _fromReset then
 					return
 				end
 				-- Ignore Reset-to-default while we already have a custom layout.
-				if _fromReset and GetJumpXPBarSaved().userPlaced then
+				if _fromReset and ns.GetJumpXPBarSaved().userPlaced then
 					return
 				end
-				local state = GetJumpXPBarState()
+				local state = ns.GetJumpXPBarState()
 				state.widthPct = value
 				state.shown = true
 				state.userPlaced = true
 				if jumpXPBarDraft then
-					MarkJumpXPBarEditDirty()
+					ns.MarkJumpXPBarEditDirty()
 				else
-					CommitJumpXPBarState(state)
+					ns.CommitJumpXPBarState(state)
 				end
 				if jumpXPBar then
-					ApplyJumpXPBarLayout(jumpXPBar, state)
+					ns.ApplyJumpXPBarLayout(jumpXPBar, state)
 				end
 			end,
 		},
 	})
 
 	LibEditMode:RegisterCallback("enter", function()
-		EnsureDB()
-		BeginJumpXPBarEditSession()
-		UpdateJumpXPBar()
+		ns.EnsureDB()
+		ns.BeginJumpXPBarEditSession()
+		ns.UpdateJumpXPBar()
 	end)
 
 	LibEditMode:RegisterCallback("exit", function()
-		EndJumpXPBarEditSession()
+		ns.EndJumpXPBarEditSession()
 	end)
 
 	-- Edit Mode layout info arrives after ADDON_LOADED; re-apply saved bar then.
 	LibEditMode:RegisterCallback("layout", function()
-		RestoreJumpXPBarFromSaved()
+		ns.RestoreJumpXPBarFromSaved()
 	end)
 
 	-- Blizzard Save / Revert All Changes (retry until EditModeManagerFrame exists).
@@ -2746,16 +2406,16 @@ local function SetupJumpXPBarEditMode(holder)
 		holder._ajhSaveHooked = true
 		if EditModeManagerFrame.SaveLayouts then
 			hooksecurefunc(EditModeManagerFrame, "SaveLayouts", function()
-				CommitJumpXPBarEditSession()
+				ns.CommitJumpXPBarEditSession()
 			end)
 		end
 		if EditModeManagerFrame.RevertAllChanges then
 			hooksecurefunc(EditModeManagerFrame, "RevertAllChanges", function()
-				RevertJumpXPBarEditSession()
+				ns.RevertJumpXPBarEditSession()
 			end)
 		end
 		EventRegistry:RegisterCallback("EditMode.SavedLayouts", function()
-			CommitJumpXPBarEditSession()
+			ns.CommitJumpXPBarEditSession()
 		end)
 		return true
 	end
@@ -2771,17 +2431,18 @@ local function SetupJumpXPBarEditMode(holder)
 		end)
 	end
 
-	RestoreJumpXPBarFromSaved()
+	ns.RestoreJumpXPBarFromSaved()
 end
 
-local function BuildJumpXPBar()
+function ns.BuildJumpXPBar()
 	if jumpXPBar then
 		return jumpXPBar
 	end
 
-	EnsureDB()
+	ns.EnsureDB()
 
-	-- Status-tracking XP chrome (HUD atlases) with classic UI-XP-Bar fallback.
+	-- 1.2.0 Status-tracking XP chrome (HUD atlases) with classic UI-XP-Bar fallback.
+	-- Fill tinted Habit-dialog yellow (1.0, 0.82, 0).
 	local holder = CreateFrame("Frame", "AJHJumpXPBar", UIParent)
 	holder:SetFrameStrata("MEDIUM")
 	holder:SetFrameLevel(50)
@@ -2791,7 +2452,7 @@ local function BuildJumpXPBar()
 	local barBg = holder:CreateTexture(nil, "BACKGROUND", nil, -1)
 	barBg:SetPoint("TOPLEFT", 1, -1)
 	barBg:SetPoint("BOTTOMRIGHT", -1, 1)
-	local usedHudBg = TrySetAtlas(barBg, "UI-HUD-ExperienceBar-Background")
+	local usedHudBg = ns.TrySetAtlas(barBg, "UI-HUD-ExperienceBar-Background")
 	if not usedHudBg then
 		barBg:SetTexture("Interface\\TargetingFrame\\UI-StatusBar")
 		barBg:SetVertexColor(0.0, 0.0, 0.0, 0.55)
@@ -2806,12 +2467,9 @@ local function BuildJumpXPBar()
 	local fillOk = false
 	local statusTex = bar:CreateTexture(nil, "ARTWORK")
 	bar:SetStatusBarTexture(statusTex)
-	if TrySetAtlas(statusTex, "UI-HUD-ExperienceBar-Fill-Honor") then
+	if ns.TrySetAtlas(statusTex, "UI-HUD-ExperienceBar-Fill") then
 		fillOk = true
-		bar:SetStatusBarColor(1, 1, 1)
-	elseif TrySetAtlas(statusTex, "UI-HUD-ExperienceBar-Fill") then
-		fillOk = true
-		statusTex:SetVertexColor(1.0, 0.55, 0.05)
+		statusTex:SetVertexColor(1.0, 0.82, 0.0)
 		bar:SetStatusBarColor(1, 1, 1)
 	end
 	if not fillOk then
@@ -2820,12 +2478,12 @@ local function BuildJumpXPBar()
 		if tex then
 			tex:SetHorizTile(false)
 		end
-		bar:SetStatusBarColor(1.0, 0.50, 0.0)
+		bar:SetStatusBarColor(1.0, 0.82, 0.0)
 	end
 
 	local hudFrame = holder:CreateTexture(nil, "OVERLAY", nil, 7)
 	hudFrame:SetAllPoints()
-	local usedHudFrame = TrySetAtlas(hudFrame, "UI-HUD-ExperienceBar-Frame")
+	local usedHudFrame = ns.TrySetAtlas(hudFrame, "UI-HUD-ExperienceBar-Frame")
 	if usedHudFrame then
 		holder.useClassicChrome = false
 	else
@@ -2886,7 +2544,7 @@ local function BuildJumpXPBar()
 	text:SetPoint("CENTER", holder, "CENTER", 0, 0)
 
 	holder:SetScript("OnEnter", function(self)
-		if IsEditModeActive() then
+		if ns.IsEditModeActive() then
 			return
 		end
 		GameTooltip:SetOwner(self, "ANCHOR_CURSOR")
@@ -2895,7 +2553,7 @@ local function BuildJumpXPBar()
 		if self.tipMax then
 			GameTooltip:AddLine(string.format("Level %d (max)", self.tipLevel or MAX_LEVEL), 1, 1, 1)
 			GameTooltip:AddLine(
-				string.format("XP past max: %s", FormatNumber(self.tipInto or 0)),
+				string.format("XP past max: %s", ns.FormatNumber(self.tipInto or 0)),
 				0.9, 0.9, 0.9
 			)
 		else
@@ -2903,18 +2561,18 @@ local function BuildJumpXPBar()
 			GameTooltip:AddLine(
 				string.format(
 					"%s / %s XP this level",
-					FormatNumber(self.tipInto or 0),
-					FormatNumber(self.tipNeeded or 0)
+					ns.FormatNumber(self.tipInto or 0),
+					ns.FormatNumber(self.tipNeeded or 0)
 				),
 				0.9, 0.9, 0.9
 			)
 			GameTooltip:AddLine(
-				string.format("%s XP remaining", FormatNumber(self.tipRemaining or 0)),
+				string.format("%s XP remaining", ns.FormatNumber(self.tipRemaining or 0)),
 				0.9, 0.9, 0.9
 			)
 		end
 		GameTooltip:AddLine(
-			string.format("Total jumps: %s", FormatNumber(self.tipJumps or 0)),
+			string.format("Total jumps: %s", ns.FormatNumber(self.tipJumps or 0)),
 			0.7, 0.7, 0.7
 		)
 		GameTooltip:AddLine("Edit Mode: move, width, and reset", 0.55, 0.55, 0.55)
@@ -2933,19 +2591,26 @@ local function BuildJumpXPBar()
 	holder.text = text
 	jumpXPBar = holder
 
-	ApplyJumpXPBarLayout(holder)
-	SetupJumpXPBarEditMode(holder)
-	UpdateJumpXPBar()
+	ns.ApplyJumpXPBarLayout(holder)
+	ns.SetupJumpXPBarEditMode(holder)
+	if not holder.editModeReady then
+		C_Timer.After(0, function()
+			if jumpXPBar and not jumpXPBar.editModeReady then
+				ns.SetupJumpXPBarEditMode(jumpXPBar)
+			end
+		end)
+	end
+	ns.UpdateJumpXPBar()
 	return holder
 end
 
-local function StoreScore(key, name, jumps, achMask, xp, achs)
-	EnsureDB()
-	if type(AJHDB) ~= "table" then
+function ns.StoreScore(key, name, jumps, achMask, xp, achs)
+	local db = ns.EnsureDB()
+	if not db then
 		return
 	end
-	if type(AJHDB.board) ~= "table" then
-		AJHDB.board = {}
+	if type(db.board) ~= "table" then
+		db.board = {}
 	end
 	local jumpsN = tonumber(jumps) or 0
 	local xpN = tonumber(xp)
@@ -2956,22 +2621,22 @@ local function StoreScore(key, name, jumps, achMask, xp, achs)
 	local achsN = tonumber(achs)
 	if achsN == nil then
 		-- Legacy: derive a (possibly truncated) count from the bitmask.
-		achsN = CountAchievementsFromMask(achMask)
+		achsN = ns.CountAchievementsFromMask(achMask)
 	end
-	local prev = AJHDB.board[key]
+	local prev = db.board[key]
 	-- Raise-only so a stale broadcast cannot demote a richer row.
 	if type(prev) == "table" then
-		if ToNumberOr(prev.jumps, 0) > jumpsN then
-			jumpsN = ToNumberOr(prev.jumps, 0)
+		if ns.ToNumberOr(prev.jumps, 0) > jumpsN then
+			jumpsN = ns.ToNumberOr(prev.jumps, 0)
 		end
-		if ToNumberOr(prev.xp, 0) > xpN then
-			xpN = ToNumberOr(prev.xp, 0)
+		if ns.ToNumberOr(prev.xp, 0) > xpN then
+			xpN = ns.ToNumberOr(prev.xp, 0)
 		end
-		if ToNumberOr(prev.achs, 0) > achsN then
-			achsN = ToNumberOr(prev.achs, 0)
+		if ns.ToNumberOr(prev.achs, 0) > achsN then
+			achsN = ns.ToNumberOr(prev.achs, 0)
 		end
 	end
-	AJHDB.board[key] = {
+	db.board[key] = {
 		name = name or (type(prev) == "table" and prev.name) or key,
 		jumps = jumpsN,
 		xp = xpN,
@@ -2981,7 +2646,7 @@ local function StoreScore(key, name, jumps, achMask, xp, achs)
 	}
 end
 
-local function SendGuildAddonMessage(message)
+function ns.SendGuildAddonMessage(message)
 	if not IsInGuild() then
 		return false, "not-in-guild"
 	end
@@ -3009,7 +2674,7 @@ local function SendGuildAddonMessage(message)
 	return true, result
 end
 
-local function SendWhisperAddonMessage(message, target)
+function ns.SendWhisperAddonMessage(message, target)
 	if type(target) ~= "string" or target == "" then
 		return false
 	end
@@ -3029,7 +2694,7 @@ local lastGuildSyncNote = "not-run"
 local lastGuildRecvNote = "none"
 local lastGuildSendNote = "none"
 
-local function IterOnlineGuildNames()
+function ns.IterOnlineGuildNames()
 	local names = {}
 	if not IsInGuild() then
 		return names
@@ -3051,12 +2716,12 @@ local function IterOnlineGuildNames()
 	return names
 end
 
-local function BroadcastScorePayload(message)
-	local guildOk, guildResult = SendGuildAddonMessage(message)
+function ns.BroadcastScorePayload(message)
+	local guildOk, guildResult = ns.SendGuildAddonMessage(message)
 	local whispered = 0
 	local whisperFail = 0
-	for _, target in ipairs(IterOnlineGuildNames()) do
-		local wOk = SendWhisperAddonMessage(message, target)
+	for _, target in ipairs(ns.IterOnlineGuildNames()) do
+		local wOk = ns.SendWhisperAddonMessage(message, target)
 		if wOk then
 			whispered = whispered + 1
 		else
@@ -3073,7 +2738,7 @@ local function BroadcastScorePayload(message)
 	return guildOk or whispered > 0
 end
 
-local function IsAjhAddonChannel(channel)
+function ns.IsAjhAddonChannel(channel)
 	if channel == nil or channel == "GUILD" or channel == "OFFICER" or channel == "WHISPER" then
 		return true
 	end
@@ -3098,43 +2763,43 @@ local function IsAjhAddonChannel(channel)
 	return false
 end
 
-BroadcastScore = function()
+function ns.BroadcastScore()
 	if not IsInGuild() then
 		lastGuildSyncNote = "skip-not-in-guild"
 		return
 	end
-	EnsureDB()
-	if type(AJHDB) ~= "table" then
+	local db = ns.EnsureDB()
+	if not db then
 		lastGuildSyncNote = "skip-no-db"
 		return
 	end
-	local key, name = PlayerIdentity()
+	local key, name = ns.PlayerIdentity()
 	if not key then
 		lastGuildSyncNote = "skip-no-identity"
 		return
 	end
-	local mask = GetAchievementMask()
-	local achs = CountOwnAchievements()
-	local jumps = ToNumberOr(AJHDB.jumps, 0)
-	local xp = ToNumberOr(AJHDB.xp, 0)
-	StoreScore(key, name, jumps, mask, xp, achs)
+	local mask = ns.GetAchievementMask()
+	local achs = ns.CountOwnAchievements()
+	local jumps = ns.ToNumberOr(db.jumps, 0)
+	local xp = ns.ToNumberOr(db.xp, 0)
+	ns.StoreScore(key, name, jumps, mask, xp, achs)
 	-- Y: feat count (correct with many feats). X/S: legacy capped 31-bit mask.
 	local yMsg = string.format("Y:%d:%d:%d", jumps, achs, xp)
 	local sMsg = string.format("S:%d:%d", jumps, mask)
 	local xMsg = string.format("X:%d:%d:%d", jumps, mask, xp)
-	SendGuildAddonMessage(yMsg)
-	SendGuildAddonMessage(sMsg)
-	SendGuildAddonMessage(xMsg)
+	ns.SendGuildAddonMessage(yMsg)
+	ns.SendGuildAddonMessage(sMsg)
+	ns.SendGuildAddonMessage(xMsg)
 	local whispered = 0
 	local whisperFail = 0
-	for _, target in ipairs(IterOnlineGuildNames()) do
-		if SendWhisperAddonMessage(yMsg, target) then
+	for _, target in ipairs(ns.IterOnlineGuildNames()) do
+		if ns.SendWhisperAddonMessage(yMsg, target) then
 			whispered = whispered + 1
 		else
 			whisperFail = whisperFail + 1
 		end
-		SendWhisperAddonMessage(sMsg, target)
-		SendWhisperAddonMessage(xMsg, target)
+		ns.SendWhisperAddonMessage(sMsg, target)
+		ns.SendWhisperAddonMessage(xMsg, target)
 	end
 	-- Also party/raid if grouped with them.
 	if IsInGroup and IsInGroup() then
@@ -3147,27 +2812,27 @@ BroadcastScore = function()
 			end
 		end)
 	end
-	lastGuildSendNote = string.format("whispered=%d fail=%d onlinePeers=%d", whispered, whisperFail, #IterOnlineGuildNames())
+	lastGuildSendNote = string.format("whispered=%d fail=%d onlinePeers=%d", whispered, whisperFail, #ns.IterOnlineGuildNames())
 	lastGuildSyncNote = "broadcast " .. lastGuildSendNote
 end
 
-local function RequestGuildScores()
+function ns.RequestGuildScores()
 	if not IsInGuild() then
 		lastGuildSyncNote = "request-not-in-guild"
 		return
 	end
-	BroadcastScore()
-	SendGuildAddonMessage("R")
+	ns.BroadcastScore()
+	ns.SendGuildAddonMessage("R")
 	local asked = 0
-	for _, target in ipairs(IterOnlineGuildNames()) do
-		if SendWhisperAddonMessage("R", target) then
+	for _, target in ipairs(ns.IterOnlineGuildNames()) do
+		if ns.SendWhisperAddonMessage("R", target) then
 			asked = asked + 1
 		end
 	end
 	lastGuildSyncNote = string.format("request whisperedR=%d %s", asked, lastGuildSendNote)
 end
 
-local function CreateStatRow(parent, anchor, y)
+function ns.CreateStatRow(parent, anchor, y)
 	local label = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	label:SetPoint("TOPLEFT", anchor, "TOPLEFT", 16, y)
 
@@ -3177,7 +2842,7 @@ local function CreateStatRow(parent, anchor, y)
 	return label, value
 end
 
-local function CreateScrollArea(parent)
+function ns.CreateScrollArea(parent)
 	local wrap = CreateFrame("Frame", nil, parent, "InsetFrameTemplate")
 	wrap:SetPoint("TOPLEFT", 4, -4)
 	wrap:SetPoint("BOTTOMRIGHT", -4, 4)
@@ -3193,8 +2858,8 @@ local function CreateScrollArea(parent)
 	return wrap, scroll, child
 end
 
-local function PlayUISound(kit, fallback)
-	if not SoundsAllowed() then
+function ns.PlayUISound(kit, fallback)
+	if not ns.SoundsAllowed() then
 		return
 	end
 	if SOUNDKIT and SOUNDKIT[kit] then
@@ -3204,7 +2869,7 @@ local function PlayUISound(kit, fallback)
 	end
 end
 
-local function ScrollLevelsToCurrent(level)
+function ns.ScrollLevelsToCurrent(level)
 	local scroll = ui.levelScroll
 	local child = ui.levelChild
 	if not scroll or not child or not level then
@@ -3228,39 +2893,53 @@ local function ScrollLevelsToCurrent(level)
 	scroll:SetVerticalScroll(target)
 end
 
-local function SetTab(id, silent)
+function ns.UpdateSettingsButton()
+	local btn = ui.settingsButton
+	if not btn or not btn.icon then
+		return
+	end
+	if activeTab == "settings" then
+		btn.icon:SetVertexColor(1, 0.82, 0)
+	else
+		btn.icon:SetVertexColor(0.9, 0.9, 0.9)
+	end
+end
+
+function ns.SetTab(id, silent)
 	local changed = activeTab ~= id
 	activeTab = id
 	for tabId, page in pairs(ui.pages) do
 		page:SetShown(tabId == id)
 	end
-	if panel and ui.tabIndex and ui.tabIndex[id] then
-		PanelTemplates_SetTab(panel, ui.tabIndex[id])
+	if panel and ui.tabButtons then
+		if id == "settings" then
+			-- Settings is a separate gear button, not a PanelTemplates tab.
+			for _, tab in ipairs(ui.tabButtons) do
+				if PanelTemplates_DeselectTab then
+					PanelTemplates_DeselectTab(tab)
+				end
+			end
+			panel.selectedTab = 0
+		elseif ui.tabIndex and ui.tabIndex[id] then
+			PanelTemplates_SetTab(panel, ui.tabIndex[id])
+		end
 	end
-	if id == "habit" then
-		-- Leaving Habit and returning should always land on Habit main.
-		ShowHabitView("main")
+	ns.UpdateSettingsButton()
+	if id == "stats" then
+		ns.ShowStatsView("main")
 	end
 	if id == "guild" then
-		RequestGuildScores()
+		ns.RequestGuildScores()
 	end
 	if panel then
 		panel:Update()
 	end
-	if id == "levels" then
-		EnsureDB()
-		local level = GetLevel(AJHDB.xp)
-		-- Defer until the scroll frame has a real height after Show().
-		C_Timer.After(0, function()
-			ScrollLevelsToCurrent(level)
-		end)
-	end
 	if not silent and changed then
-		PlayUISound("IG_CHARACTER_INFO_TAB", 841)
+		ns.PlayUISound("IG_CHARACTER_INFO_TAB", 841)
 	end
 end
 
-local function BuildLevelRows(parent)
+function ns.BuildLevelRows(parent)
 		local header = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	header:SetPoint("TOPLEFT", 8, -4)
 	header:SetText("LEVEL")
@@ -3285,14 +2964,14 @@ local function BuildLevelRows(parent)
 
 		row.xp = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
 		row.xp:SetPoint("RIGHT", -8, 0)
-		row.xp:SetText(FormatNumber(xpForLevel[level]))
+		row.xp:SetText(ns.FormatNumber(xpForLevel[level]))
 
 		row.diff = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 		row.diff:SetPoint("CENTER", 20, 0)
 		if level == 1 then
 			row.diff:SetText("")
 		else
-			row.diff:SetText("+" .. FormatNumber(xpForLevel[level] - xpForLevel[level - 1]))
+			row.diff:SetText("+" .. ns.FormatNumber(xpForLevel[level] - xpForLevel[level - 1]))
 		end
 
 		ui.levelRows[level] = row
@@ -3301,7 +2980,7 @@ local function BuildLevelRows(parent)
 	parent:SetSize(300, 24 + MAX_LEVEL * ROW_HEIGHT)
 end
 
-local function UpdateLevelRows(currentLevel)
+function ns.UpdateLevelRows(currentLevel)
 	for level, row in pairs(ui.levelRows) do
 		if level == currentLevel then
 			row.bg:SetColorTexture(1, 0.82, 0, 0.18)
@@ -3316,7 +2995,7 @@ local function UpdateLevelRows(currentLevel)
 	end
 end
 
-local function EnsureBoardRow(parent, index)
+function ns.EnsureBoardRow(parent, index)
 	local row = ui.boardRows[index]
 	if row then
 		return row
@@ -3354,30 +3033,30 @@ local function EnsureBoardRow(parent, index)
 	return row
 end
 
-UpdateLeaderboard = function()
-	EnsureDB()
-	if type(AJHDB) ~= "table" then
+function ns.UpdateLeaderboard()
+	local db = ns.EnsureDB()
+	if not db then
 		return
 	end
-	local key, name = PlayerIdentity()
-	StoreScore(key, name, AJHDB.jumps, GetAchievementMask(), AJHDB.xp, CountOwnAchievements())
+	local key, name = ns.PlayerIdentity()
+	ns.StoreScore(key, name, db.jumps, ns.GetAchievementMask(), db.xp, ns.CountOwnAchievements())
 
 	local entries = {}
-	for entryKey, data in pairs(AJHDB.board) do
+	for entryKey, data in pairs(db.board) do
 		if type(data) == "table" and type(data.jumps) == "number" then
-			local achCount = ToNumberOr(data.achs, nil)
+			local achCount = ns.ToNumberOr(data.achs, nil)
 			if achCount == nil then
-				achCount = CountAchievementsFromMask(data.achMask)
+				achCount = ns.CountAchievementsFromMask(data.achMask)
 			end
 			if entryKey == key then
-				achCount = CountOwnAchievements()
+				achCount = ns.CountOwnAchievements()
 			end
-			local entryXp = ToNumberOr(data.xp, data.jumps)
+			local entryXp = ns.ToNumberOr(data.xp, data.jumps)
 			tinsert(entries, {
 				key = entryKey,
 				name = data.name or entryKey,
 				jumps = data.jumps,
-				level = GetLevel(entryXp),
+				level = ns.GetLevel(entryXp),
 				achs = achCount,
 			})
 		end
@@ -3398,7 +3077,7 @@ UpdateLeaderboard = function()
 			ui.guildEmpty:SetText("Join a guild to share a Jump Habit leaderboard.")
 			ui.guildEmpty:Show()
 		elseif #entries <= 1 then
-			ui.guildEmpty:SetText("Waiting for guildmates with AJH… Open this tab while they are online.")
+			ui.guildEmpty:SetText("Waiting for guildmates with AJH? Open this tab while they are online.")
 			if #entries == 0 then
 				ui.guildEmpty:Show()
 			else
@@ -3417,7 +3096,7 @@ UpdateLeaderboard = function()
 	end
 
 	for i, entry in ipairs(entries) do
-		local row = EnsureBoardRow(child, i)
+		local row = ns.EnsureBoardRow(child, i)
 		row:ClearAllPoints()
 		row:SetPoint("TOPLEFT", 0, -20 - (i - 1) * ROW_HEIGHT)
 		row:SetPoint("TOPRIGHT", 0, -20 - (i - 1) * ROW_HEIGHT)
@@ -3426,7 +3105,7 @@ UpdateLeaderboard = function()
 		row.rank:SetText(tostring(i))
 		row.name:SetText(entry.name)
 		row.level:SetText(tostring(entry.level))
-		row.jumps:SetText(FormatNumber(entry.jumps))
+		row.jumps:SetText(ns.FormatNumber(entry.jumps))
 		row.achs:SetText(string.format("%d/%d", entry.achs, #ACHIEVEMENTS))
 
 		local mine = entry.key == key
@@ -3453,15 +3132,35 @@ UpdateLeaderboard = function()
 end
 
 local ACH_ROW_HEIGHT = 48
-local FEAT_CAT_ROW_HEIGHT = 52
+local FEAT_CAT_COLS = 2
+local FEAT_CAT_CARD_HEIGHT = 138
+local FEAT_CAT_CARD_GAP = 12
+local FEAT_CAT_PAD = 10
+local FEAT_CAT_ICON = 42
+local FEAT_CAT_BAR_H = 18
+local FEAT_CAT_INSET = 8
 
-local function HideFeatRows(rows)
+local FEAT_CAT_ICONS = {
+	city = "Interface\\Icons\\Achievement_Zone_EasternKingdoms_01",
+	town = "Interface\\Icons\\Achievement_Zone_TirisfalGlades_01",
+	hostile = "Interface\\Icons\\Ability_DualWield",
+	dungeon = "Interface\\Icons\\Achievement_Dungeon_ClassicDungeonMaster",
+	raid = "Interface\\Icons\\Achievement_Boss_Ragnaros",
+	milestone = "Interface\\Icons\\Achievement_General",
+	style = "Interface\\Icons\\Spell_Nature_Polymorph",
+	travel = "Interface\\Icons\\Ability_TownWatch",
+	social = "Interface\\Icons\\INV_Misc_GroupLooking",
+	collection = "Interface\\Icons\\INV_Misc_Coin_01",
+	oddity = "Interface\\Icons\\INV_Misc_Bomb_02",
+}
+
+function ns.HideFeatRows(rows)
 	for _, row in pairs(rows) do
 		row:Hide()
 	end
 end
 
-local function StyleFeatItemRow(row, ach, done)
+function ns.StyleFeatItemRow(row, ach, done)
 	row.title:SetText(ach.name)
 	row.desc:SetText(ach.desc)
 	if done then
@@ -3478,7 +3177,7 @@ local function StyleFeatItemRow(row, ach, done)
 	end
 end
 
-local function EnsureFeatItemRow(i)
+function ns.EnsureFeatItemRow(i)
 	local child = ui.achChild
 	local row = ui.achRows[i]
 	if row then
@@ -3508,59 +3207,203 @@ local function EnsureFeatItemRow(i)
 	return row
 end
 
-local function EnsureFeatCategoryRow(i)
+function ns.EnsureFeatCategoryRow(i)
 	local child = ui.achChild
 	local row = ui.featCatRows[i]
 	if row then
 		return row
 	end
+	-- Category tiles: compact 2x2 cards (layout applied in UpdateAchievements).
 	row = CreateFrame("Button", nil, child)
-	row:SetHeight(FEAT_CAT_ROW_HEIGHT)
+	row:SetHeight(FEAT_CAT_CARD_HEIGHT)
 	row:RegisterForClicks("LeftButtonUp")
 
+	row.shadow = row:CreateTexture(nil, "BACKGROUND", nil, -1)
+	row.shadow:SetPoint("TOPLEFT", 4, -4)
+	row.shadow:SetPoint("BOTTOMRIGHT", 0, 0)
+	row.shadow:SetColorTexture(0, 0, 0, 0.4)
+
 	row.bg = row:CreateTexture(nil, "BACKGROUND")
-	row.bg:SetAllPoints()
-	row.bg:SetColorTexture(1, 1, 1, 0.04)
+	row.bg:SetPoint("TOPLEFT", 1, -1)
+	row.bg:SetPoint("BOTTOMRIGHT", -1, 1)
+	row.bg:SetColorTexture(0.10, 0.12, 0.10, 0.96)
+
+	-- Thin 1px rim (same language as Habit bar edges ? not a fat tooltip stud border).
+	local function CardEdge()
+		local edge = row:CreateTexture(nil, "OVERLAY", nil, 7)
+		edge:SetColorTexture(0.72, 0.62, 0.28, 0.95)
+		edge:SetSize(1, 1)
+		return edge
+	end
+	local eTop = CardEdge()
+	eTop:SetPoint("TOPLEFT", row.bg, "TOPLEFT", 0, 0)
+	eTop:SetPoint("TOPRIGHT", row.bg, "TOPRIGHT", 0, 0)
+	local eBottom = CardEdge()
+	eBottom:SetPoint("BOTTOMLEFT", row.bg, "BOTTOMLEFT", 0, 0)
+	eBottom:SetPoint("BOTTOMRIGHT", row.bg, "BOTTOMRIGHT", 0, 0)
+	local eLeft = CardEdge()
+	eLeft:SetPoint("TOPLEFT", row.bg, "TOPLEFT", 0, 0)
+	eLeft:SetPoint("BOTTOMLEFT", row.bg, "BOTTOMLEFT", 0, 0)
+	local eRight = CardEdge()
+	eRight:SetPoint("TOPRIGHT", row.bg, "TOPRIGHT", 0, 0)
+	eRight:SetPoint("BOTTOMRIGHT", row.bg, "BOTTOMRIGHT", 0, 0)
+	row.cardEdges = { eTop, eBottom, eLeft, eRight }
 
 	row.hl = row:CreateTexture(nil, "HIGHLIGHT")
-	row.hl:SetAllPoints()
-	row.hl:SetColorTexture(1, 1, 1, 0.08)
+	row.hl:SetPoint("TOPLEFT", row.bg, "TOPLEFT", 1, -1)
+	row.hl:SetPoint("BOTTOMRIGHT", row.bg, "BOTTOMRIGHT", -1, 1)
+	row.hl:SetColorTexture(1, 0.9, 0.45, 0.10)
 
-	row.icon = row:CreateTexture(nil, "ARTWORK")
-	row.icon:SetSize(22, 22)
-	row.icon:SetPoint("LEFT", 10, 0)
-	row.icon:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
+	-- Habit-style XP bar at the bottom: tooltip chrome + gold StatusBar + on-bar text.
+	row.barWrap = CreateFrame("Frame", nil, row)
+	row.barWrap:SetHeight(FEAT_CAT_BAR_H)
+	row.barWrap:SetPoint("BOTTOMLEFT", row.bg, "BOTTOMLEFT", FEAT_CAT_INSET, FEAT_CAT_INSET)
+	row.barWrap:SetPoint("BOTTOMRIGHT", row.bg, "BOTTOMRIGHT", -FEAT_CAT_INSET, FEAT_CAT_INSET)
+	row.barWrap:SetFrameLevel(row:GetFrameLevel() + 2)
 
-	row.title = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	row.title:SetPoint("TOPLEFT", 42, -10)
-	row.title:SetPoint("TOPRIGHT", -56, -10)
-	row.title:SetJustifyH("LEFT")
+	local barBorder = CreateFrame("Frame", nil, row.barWrap, BackdropTemplateMixin and "BackdropTemplate" or nil)
+	barBorder:SetPoint("TOPLEFT", 0, 0)
+	barBorder:SetPoint("BOTTOMRIGHT", 0, 0)
+	barBorder:SetFrameLevel(row.barWrap:GetFrameLevel() + 3)
+	if barBorder.SetBackdrop then
+		barBorder:SetBackdrop({
+			edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+			edgeSize = 12,
+			insets = { left = 3, right = 3, top = 3, bottom = 3 },
+		})
+		barBorder:SetBackdropBorderColor(0.45, 0.45, 0.45, 1)
+	end
+	row.barBorder = barBorder
 
+	row.bar = CreateFrame("StatusBar", nil, row.barWrap)
+	row.bar:SetPoint("TOPLEFT", row.barWrap, "TOPLEFT", 3, -3)
+	row.bar:SetPoint("BOTTOMRIGHT", row.barWrap, "BOTTOMRIGHT", -3, 3)
+	row.bar:SetMinMaxValues(0, 1)
+	row.bar:SetValue(0)
+	row.bar:SetFrameLevel(row.barWrap:GetFrameLevel() + 1)
+	row.bar:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
+	row.bar:SetStatusBarColor(1.0, 0.82, 0.0, 1)
+	local fillTex = row.bar:GetStatusBarTexture()
+	if fillTex then
+		fillTex:SetHorizTile(false)
+		fillTex:SetVertTile(false)
+	end
+	local track = row.bar:CreateTexture(nil, "BACKGROUND")
+	track:SetAllPoints()
+	track:SetColorTexture(0.08, 0.07, 0.04, 1)
+
+	-- Count lives on the bar (same place as Habit "Jump Habit X/Y").
+	row.progress = row.bar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	row.progress:SetPoint("CENTER", row.bar, "CENTER", 0, 0)
+	row.progress:SetTextColor(1, 1, 1, 1)
+	do
+		local fontPath, fontSize = row.progress:GetFont()
+		if fontPath then
+			row.progress:SetFont(fontPath, fontSize or 11, "OUTLINE")
+		end
+	end
+
+	-- Icon (achievement-themed art; thin gold rim).
+	row.iconBorder = CreateFrame("Frame", nil, row)
+	row.iconBorder:SetSize(FEAT_CAT_ICON, FEAT_CAT_ICON)
+	row.iconBorder:SetPoint("TOP", row.bg, "TOP", 0, -FEAT_CAT_INSET - 2)
+	row.iconBorder:SetFrameLevel(row:GetFrameLevel() + 2)
+	local iconBg = row.iconBorder:CreateTexture(nil, "BACKGROUND")
+	iconBg:SetAllPoints()
+	iconBg:SetColorTexture(0.04, 0.04, 0.03, 1)
+	row.iconBg = iconBg
+	local function IconEdge()
+		local edge = row.iconBorder:CreateTexture(nil, "OVERLAY")
+		edge:SetColorTexture(1, 0.82, 0, 0.95)
+		edge:SetSize(1, 1)
+		return edge
+	end
+	local ibTop = IconEdge()
+	ibTop:SetPoint("TOPLEFT", 0, 0)
+	ibTop:SetPoint("TOPRIGHT", 0, 0)
+	local ibBottom = IconEdge()
+	ibBottom:SetPoint("BOTTOMLEFT", 0, 0)
+	ibBottom:SetPoint("BOTTOMRIGHT", 0, 0)
+	local ibLeft = IconEdge()
+	ibLeft:SetPoint("TOPLEFT", 0, 0)
+	ibLeft:SetPoint("BOTTOMLEFT", 0, 0)
+	local ibRight = IconEdge()
+	ibRight:SetPoint("TOPRIGHT", 0, 0)
+	ibRight:SetPoint("BOTTOMRIGHT", 0, 0)
+	row.iconEdges = { ibTop, ibBottom, ibLeft, ibRight }
+
+	row.icon = row.iconBorder:CreateTexture(nil, "ARTWORK")
+	row.icon:SetSize(FEAT_CAT_ICON - 4, FEAT_CAT_ICON - 4)
+	row.icon:SetPoint("CENTER", 0, 0)
+	row.icon:SetTexture(FEATS_ICON)
+	if row.icon.SetTexCoord then
+		row.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+	end
+
+	row.title = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	row.title:SetPoint("TOP", row.iconBorder, "BOTTOM", 0, -8)
+	row.title:SetPoint("LEFT", row.bg, "LEFT", FEAT_CAT_INSET, 0)
+	row.title:SetPoint("RIGHT", row.bg, "RIGHT", -FEAT_CAT_INSET, 0)
+	row.title:SetJustifyH("CENTER")
+	row.title:SetTextColor(1, 0.86, 0.25, 1)
+	if row.title.SetMaxLines then
+		row.title:SetMaxLines(1)
+	end
+	row.title:SetWordWrap(false)
+
+	-- Description: room to wrap; hover tooltip always shows the full line.
 	row.desc = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	row.desc:SetPoint("TOPLEFT", row.title, "BOTTOMLEFT", 0, -2)
-	row.desc:SetPoint("RIGHT", -56, 0)
-	row.desc:SetJustifyH("LEFT")
-	row.desc:SetTextColor(0.7, 0.7, 0.7, 1)
+	row.desc:SetPoint("TOP", row.title, "BOTTOM", 0, -5)
+	row.desc:SetPoint("LEFT", row.bg, "LEFT", FEAT_CAT_INSET + 2, 0)
+	row.desc:SetPoint("RIGHT", row.bg, "RIGHT", -(FEAT_CAT_INSET + 2), 0)
+	row.desc:SetPoint("BOTTOM", row.barWrap, "TOP", 0, 6)
+	row.desc:SetJustifyH("CENTER")
+	row.desc:SetJustifyV("TOP")
+	row.desc:SetTextColor(0.82, 0.84, 0.78, 1)
+	row.desc:SetWordWrap(true)
+	if row.desc.SetNonSpaceWrap then
+		row.desc:SetNonSpaceWrap(false)
+	end
+	-- No MaxLines / ellipsis ? tooltip covers overflow if any.
 
-	row.progress = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	row.progress:SetPoint("RIGHT", -12, 0)
-	row.progress:SetJustifyH("RIGHT")
+	row:SetScript("OnEnter", function(self)
+		if not self.categoryName then
+			return
+		end
+		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+		GameTooltip:SetText(self.categoryName, 1, 0.82, 0)
+		if self.categoryDesc and self.categoryDesc ~= "" then
+			GameTooltip:AddLine(self.categoryDesc, 1, 1, 1, true)
+		end
+		if self.categoryEarned and self.categoryTotal then
+			GameTooltip:AddLine(
+				string.format("%d / %d complete", self.categoryEarned, self.categoryTotal),
+				0.9,
+				0.9,
+				0.7
+			)
+		end
+		GameTooltip:Show()
+	end)
+	row:SetScript("OnLeave", function()
+		GameTooltip:Hide()
+	end)
 
 	row:SetScript("OnClick", function(self)
 		if not self.categoryId then
 			return
 		end
 		ui.featView = self.categoryId
-		PlayUISound("IG_CHARACTER_INFO_TAB", 841)
-		UpdateAchievements()
+		ns.PlayUISound("IG_CHARACTER_INFO_TAB", 841)
+		ns.UpdateAchievements()
 	end)
 
 	ui.featCatRows[i] = row
 	return row
 end
 
-UpdateAchievements = function()
-	EnsureDB()
+function ns.UpdateAchievements()
+	ns.EnsureDB()
 	local child = ui.achChild
 	if not child then
 		return
@@ -3568,7 +3411,7 @@ UpdateAchievements = function()
 
 	local totalEarned = 0
 	for _, ach in ipairs(ACHIEVEMENTS) do
-		if AJHDB.achievements[ach.id] then
+		if ns.DB().achievements[ach.id] then
 			totalEarned = totalEarned + 1
 		end
 	end
@@ -3579,9 +3422,20 @@ UpdateAchievements = function()
 	if ui.featBack then
 		ui.featBack:SetShown(inCategory)
 	end
+	if ui.achSummaryIcon then
+		ui.achSummaryIcon:ClearAllPoints()
+		if inCategory and ui.featBack then
+			ui.achSummaryIcon:SetPoint("LEFT", ui.featBack, "RIGHT", 8, 0)
+		else
+			ui.achSummaryIcon:SetPoint("TOPLEFT", 12, -14)
+		end
+		ui.achSummaryIcon:Show()
+	end
 	if ui.achSummary then
 		ui.achSummary:ClearAllPoints()
-		if inCategory and ui.featBack then
+		if ui.achSummaryIcon then
+			ui.achSummary:SetPoint("LEFT", ui.achSummaryIcon, "RIGHT", 6, 0)
+		elseif inCategory and ui.featBack then
 			ui.achSummary:SetPoint("LEFT", ui.featBack, "RIGHT", 8, 0)
 		else
 			ui.achSummary:SetPoint("TOPLEFT", 12, -16)
@@ -3589,7 +3443,7 @@ UpdateAchievements = function()
 	end
 
 	if inCategory then
-		HideFeatRows(ui.featCatRows)
+		ns.HideFeatRows(ui.featCatRows)
 
 		local catName = view
 		for _, cat in ipairs(FEAT_CATEGORIES) do
@@ -3599,16 +3453,16 @@ UpdateAchievements = function()
 			end
 		end
 
-		local feats = GetFeatsInCategory(view)
-		local earned, total = CountCategoryProgress(view)
+		local feats = ns.GetFeatsInCategory(view)
+		local earned, total = ns.CountCategoryProgress(view)
 
 		for i, ach in ipairs(feats) do
-			local row = EnsureFeatItemRow(i)
+			local row = ns.EnsureFeatItemRow(i)
 			row:ClearAllPoints()
 			row:SetPoint("TOPLEFT", 0, -(i - 1) * ACH_ROW_HEIGHT)
 			row:SetPoint("TOPRIGHT", 0, -(i - 1) * ACH_ROW_HEIGHT)
 			row:Show()
-			StyleFeatItemRow(row, ach, AJHDB.achievements[ach.id] ~= nil)
+			ns.StyleFeatItemRow(row, ach, ns.DB().achievements[ach.id] ~= nil)
 		end
 		for i = #feats + 1, #ui.achRows do
 			ui.achRows[i]:Hide()
@@ -3616,51 +3470,106 @@ UpdateAchievements = function()
 
 		child:SetSize(300, math.max(#feats, 1) * ACH_ROW_HEIGHT)
 		if ui.achSummary then
-			ui.achSummary:SetText(string.format("%s  —  %d / %d", catName, earned, total))
+			ui.achSummary:SetText(string.format("%s  ?  %d / %d", catName, earned, total))
 		end
 	else
-		HideFeatRows(ui.achRows)
+		ns.HideFeatRows(ui.achRows)
+
+		local contentW = child:GetWidth()
+		if not contentW or contentW < 80 then
+			contentW = 300
+		end
+		local cols = FEAT_CAT_COLS
+		local gaps = cols - 1
+		local cardW = (contentW - FEAT_CAT_PAD * 2 - FEAT_CAT_CARD_GAP * gaps) / cols
+		local rowsNeeded = math.ceil(#FEAT_CATEGORIES / cols)
+
+		local function SetIconEdgeColor(row, r, g, b, a)
+			if not row.iconEdges then
+				return
+			end
+			for _, edge in ipairs(row.iconEdges) do
+				edge:SetColorTexture(r, g, b, a or 1)
+			end
+		end
+
+		local function SetCardEdgeColor(row, r, g, b, a)
+			if not row.cardEdges then
+				return
+			end
+			for _, edge in ipairs(row.cardEdges) do
+				edge:SetColorTexture(r, g, b, a or 1)
+			end
+		end
+
+		local function SetCategoryBar(row, earned, total)
+			if not row.bar then
+				return
+			end
+			local maxV = (total and total > 0) and total or 1
+			row.bar:SetMinMaxValues(0, maxV)
+			row.bar:SetValue(math.min(earned or 0, maxV))
+			if row.progress then
+				row.progress:SetText(string.format("%d / %d", earned or 0, total or 0))
+			end
+		end
 
 		for i, cat in ipairs(FEAT_CATEGORIES) do
-			local row = EnsureFeatCategoryRow(i)
-			local earned, total = CountCategoryProgress(cat.id)
+			local row = ns.EnsureFeatCategoryRow(i)
+			local earned, total = ns.CountCategoryProgress(cat.id)
 			row.categoryId = cat.id
+			row.categoryName = cat.name
+			row.categoryDesc = cat.desc
+			row.categoryEarned = earned
+			row.categoryTotal = total
 			row.title:SetText(cat.name)
 			row.desc:SetText(cat.desc)
-			row.progress:SetText(string.format("%d / %d", earned, total))
+			row.icon:SetTexture(FEAT_CAT_ICONS[cat.id] or "Interface\\Icons\\INV_Misc_QuestionMark")
+			SetCategoryBar(row, earned, total)
 			if earned >= total and total > 0 then
-				row.icon:SetTexture("Interface\\RaidFrame\\ReadyCheck-Ready")
-				row.progress:SetTextColor(1, 0.82, 0, 1)
-				row.title:SetTextColor(1, 0.82, 0, 1)
-				row.bg:SetColorTexture(1, 0.82, 0, 0.10)
+				row.title:SetTextColor(1, 0.88, 0.2, 1)
+				row.bg:SetColorTexture(0.18, 0.16, 0.08, 0.97)
+				row.bar:SetStatusBarColor(1, 0.88, 0.2, 1)
+				SetCardEdgeColor(row, 1, 0.82, 0, 1)
+				SetIconEdgeColor(row, 1, 0.86, 0.25, 1)
 			elseif earned > 0 then
-				row.icon:SetTexture("Interface\\GossipFrame\\IncompleteQuestIcon")
-				row.progress:SetTextColor(1, 1, 1, 1)
-				row.title:SetTextColor(1, 1, 1, 1)
-				row.bg:SetColorTexture(1, 1, 1, 0.04)
+				row.title:SetTextColor(1, 0.86, 0.35, 1)
+				row.bg:SetColorTexture(0.11, 0.13, 0.10, 0.97)
+				row.bar:SetStatusBarColor(1, 0.82, 0, 1)
+				SetCardEdgeColor(row, 0.85, 0.72, 0.32, 0.95)
+				SetIconEdgeColor(row, 0.95, 0.8, 0.3, 0.95)
 			else
-				row.icon:SetTexture("Interface\\GossipFrame\\IncompleteQuestIcon")
-				row.progress:SetTextColor(0.7, 0.7, 0.7, 1)
-				row.title:SetTextColor(1, 1, 1, 1)
-				row.bg:SetColorTexture(1, 1, 1, 0.04)
+				row.title:SetTextColor(1, 0.82, 0.3, 1)
+				row.bg:SetColorTexture(0.09, 0.11, 0.09, 0.96)
+				row.bar:SetStatusBarColor(1, 0.82, 0, 1)
+				SetCardEdgeColor(row, 0.62, 0.55, 0.32, 0.9)
+				SetIconEdgeColor(row, 0.75, 0.65, 0.32, 0.9)
 			end
+			local col = (i - 1) % cols
+			local gridRow = math.floor((i - 1) / cols)
+			local x = FEAT_CAT_PAD + col * (cardW + FEAT_CAT_CARD_GAP)
+			local y = -(FEAT_CAT_PAD + gridRow * (FEAT_CAT_CARD_HEIGHT + FEAT_CAT_CARD_GAP))
 			row:ClearAllPoints()
-			row:SetPoint("TOPLEFT", 0, -(i - 1) * FEAT_CAT_ROW_HEIGHT)
-			row:SetPoint("TOPRIGHT", 0, -(i - 1) * FEAT_CAT_ROW_HEIGHT)
+			row:SetSize(cardW, FEAT_CAT_CARD_HEIGHT)
+			row:SetPoint("TOPLEFT", x, y)
+			SetCategoryBar(row, earned, total)
 			row:Show()
 		end
 		for i = #FEAT_CATEGORIES + 1, #ui.featCatRows do
 			ui.featCatRows[i]:Hide()
 		end
 
-		child:SetSize(300, #FEAT_CATEGORIES * FEAT_CAT_ROW_HEIGHT)
+		child:SetSize(
+			contentW,
+			FEAT_CAT_PAD * 2 + rowsNeeded * FEAT_CAT_CARD_HEIGHT + math.max(0, rowsNeeded - 1) * FEAT_CAT_CARD_GAP
+		)
 		if ui.achSummary then
 			ui.achSummary:SetText(string.format("%d / %d feats", totalEarned, #ACHIEVEMENTS))
 		end
 	end
 end
 
-local function BuildPanel()
+function ns.BuildPanel()
 	if panel then
 		return panel
 	end
@@ -3723,12 +3632,39 @@ local function BuildPanel()
 		content:SetPoint("BOTTOMRIGHT", -12, 28)
 	end
 
+	-- Settings cog on the panel chrome (inside the main border, above the inset).
+	local gear = CreateFrame("Button", "AJHSettingsButton", panel)
+	gear:SetSize(16, 16)
+	gear:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -14, -38)
+	gear:SetFrameLevel(panel:GetFrameLevel() + 10)
+	local gearIcon = gear:CreateTexture(nil, "ARTWORK")
+	gearIcon:SetTexture("Interface\\Buttons\\UI-OptionsButton")
+	gearIcon:SetSize(16, 16)
+	gearIcon:SetPoint("CENTER")
+	gearIcon:SetVertexColor(0.9, 0.9, 0.9)
+	gear.icon = gearIcon
+	gear:SetScript("OnClick", function()
+		ns.SetTab("settings")
+	end)
+	gear:SetScript("OnEnter", function(self)
+		self.icon:SetVertexColor(1, 1, 1)
+		GameTooltip:SetOwner(self, "ANCHOR_BOTTOMLEFT")
+		GameTooltip:SetText("Settings")
+		GameTooltip:Show()
+	end)
+	gear:SetScript("OnLeave", function(self)
+		GameTooltip:Hide()
+		ns.UpdateSettingsButton()
+	end)
+	ui.settingsButton = gear
+	ui.tabs.settings = gear
+	ns.UpdateSettingsButton()
+
 	local tabDefs = {
 		{ id = "habit", label = "Habit" },
-		{ id = "levels", label = "Levels" },
+		{ id = "stats", label = "Stats" },
 		{ id = "achieves", label = "Feats" },
 		{ id = "guild", label = "Guild" },
-		{ id = "settings", label = "", iconOnly = true },
 	}
 	ui.tabIndex = {}
 	ui.tabButtons = {}
@@ -3743,32 +3679,9 @@ local function BuildPanel()
 			tab:SetPoint("LEFT", ui.tabButtons[i - 1], "RIGHT", 3, 0)
 		end
 		tab:SetScript("OnClick", function(self)
-			SetTab(self.tabId)
+			ns.SetTab(self.tabId)
 		end)
-		if def.iconOnly then
-			-- Compact gear tab (no text label).
-			local icon = tab:CreateTexture(nil, "ARTWORK")
-			icon:SetTexture("Interface\\Buttons\\UI-OptionsButton")
-			icon:SetSize(14, 14)
-			icon:SetPoint("CENTER", 0, -1)
-			tab.settingsIcon = icon
-			if tab.Text then
-				tab.Text:SetText("")
-				tab.Text:Hide()
-			end
-			tab:SetWidth(32)
-			if PanelTemplates_TabResize then
-				PanelTemplates_TabResize(tab, -18)
-			end
-			tab:SetScript("OnEnter", function(self)
-				GameTooltip:SetOwner(self, "ANCHOR_TOP")
-				GameTooltip:SetText("Settings")
-				GameTooltip:Show()
-			end)
-			tab:SetScript("OnLeave", function()
-				GameTooltip:Hide()
-			end)
-		elseif PanelTemplates_TabResize then
+		if PanelTemplates_TabResize then
 			PanelTemplates_TabResize(tab, 0)
 		end
 		ui.tabButtons[i] = tab
@@ -3778,7 +3691,7 @@ local function BuildPanel()
 	PanelTemplates_SetNumTabs(panel, #tabDefs)
 	PanelTemplates_SetTab(panel, 1)
 
-	-- Habit page (main + nested Statistics)
+	-- Habit page
 	local habit = CreateFrame("Frame", nil, content)
 	habit:SetAllPoints()
 	ui.pages.habit = habit
@@ -3786,18 +3699,6 @@ local function BuildPanel()
 	local habitMain = CreateFrame("Frame", nil, habit)
 	habitMain:SetAllPoints()
 	ui.habitMain = habitMain
-
-	local statsBtn = CreateFrame("Button", nil, habitMain, "UIPanelButtonTemplate")
-	statsBtn:SetSize(88, 20)
-	statsBtn:SetPoint("TOPRIGHT", -6, -6)
-	statsBtn:SetText("Statistics")
-	statsBtn:SetScript("OnClick", function()
-		ShowHabitView("stats")
-		if panel then
-			panel:Update()
-		end
-	end)
-	ui.habitStatsBtn = statsBtn
 
 	local levelLabel = habitMain:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	levelLabel:SetPoint("TOP", 0, -8)
@@ -3815,14 +3716,14 @@ local function BuildPanel()
 		ui.level:SetShadowColor(0, 0, 0, 0.85)
 	end
 
-	-- Habit XP bar: flat yellow fill flush to the frame (no texture padding gaps).
+	-- Habit XP bar (dialog): 1.2.0 design ? tooltip border + gold fill + silver tip.
 	local BAR_PAD = 22
 	local barWrap = CreateFrame("Frame", nil, habitMain)
 	barWrap:ClearAllPoints()
 	barWrap:SetPoint("TOP", ui.level, "BOTTOM", 0, -14)
 	barWrap:SetPoint("LEFT", habitMain, "LEFT", BAR_PAD, 0)
 	barWrap:SetPoint("RIGHT", habitMain, "RIGHT", -BAR_PAD, 0)
-	barWrap:SetHeight(22)
+	barWrap:SetHeight(HABIT_PANEL_XP_BAR_HEIGHT)
 	ui.barWrap = barWrap
 
 	-- Border first so the StatusBar can fill its interior tightly.
@@ -3846,7 +3747,7 @@ local function BuildPanel()
 	ui.bar:SetMinMaxValues(0, 1)
 	ui.bar:SetValue(0)
 	ui.bar:SetFrameLevel(barWrap:GetFrameLevel() + 1)
-	-- Solid fill — UI-StatusBar has transparent margins that left black lines.
+	-- Solid fill - UI-StatusBar has transparent margins that left black lines.
 	ui.bar:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
 	ui.bar:SetStatusBarColor(1.0, 0.82, 0.0, 1)
 	local fillTex = ui.bar:GetStatusBarTexture()
@@ -3896,7 +3797,13 @@ local function BuildPanel()
 			return
 		end
 		local fillW = width * pct
-		local tipW = math.min(56, math.max(28, fillW * 0.38))
+		-- Tip must stay inside the filled region (never spill left of the bar).
+		local tipW = math.min(56, math.max(16, fillW * 0.38))
+		tipW = math.min(tipW, fillW)
+		if tipW < 8 then
+			spark:Hide()
+			return
+		end
 		spark:SetWidth(tipW)
 		spark:ClearAllPoints()
 		spark:SetPoint("TOPRIGHT", bar, "TOPLEFT", fillW, 0)
@@ -3965,112 +3872,52 @@ local function BuildPanel()
 	ui.rateValue:SetPoint("TOPRIGHT", ui.nextValue, "BOTTOMRIGHT", 0, -10)
 	ui.rateValue:SetText(tostring(XP_PER_JUMP))
 
-	local function MakeAnnounceButton(parent, label)
-		local btn = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
-		btn:SetHeight(22)
-		btn:SetText(label)
-		return btn
-	end
-
-	local function AnnounceStatus(channel)
-		EnsureDB()
-		local level = GetLevel(AJHDB.xp)
-		local jumps = AJHDB.jumps
-		SendChatMessage(
-			string.format(
-				"Jump Habit: Level %d - %s jump%s",
-				level,
-				FormatNumber(jumps),
-				jumps == 1 and "" or "s"
-			),
-			channel
-		)
-	end
-
-	-- One tidy row of three equal buttons.
-	local BTN_PAD = 12
-	local BTN_GAP = 6
-	local btnRow = CreateFrame("Frame", nil, habitMain)
-	btnRow:SetPoint("BOTTOMLEFT", BTN_PAD, 10)
-	btnRow:SetPoint("BOTTOMRIGHT", -BTN_PAD, 10)
-	btnRow:SetHeight(22)
-
-	ui.jumpXPBarToggle = MakeAnnounceButton(btnRow, "Show XP Bar")
-	local announceSay = MakeAnnounceButton(btnRow, "Announce /say")
-	local announceGuild = MakeAnnounceButton(btnRow, "Announce /g")
-
-	local function LayoutHabitButtons()
-		local width = btnRow:GetWidth()
-		if not width or width <= 0 then
-			return
-		end
-		local btnW = (width - BTN_GAP * 2) / 3
-		ui.jumpXPBarToggle:ClearAllPoints()
-		ui.jumpXPBarToggle:SetSize(btnW, 22)
-		ui.jumpXPBarToggle:SetPoint("LEFT", btnRow, "LEFT", 0, 0)
-
-		announceSay:ClearAllPoints()
-		announceSay:SetSize(btnW, 22)
-		announceSay:SetPoint("LEFT", ui.jumpXPBarToggle, "RIGHT", BTN_GAP, 0)
-
-		announceGuild:ClearAllPoints()
-		announceGuild:SetSize(btnW, 22)
-		announceGuild:SetPoint("LEFT", announceSay, "RIGHT", BTN_GAP, 0)
-	end
-
-	btnRow:SetScript("OnSizeChanged", LayoutHabitButtons)
-	LayoutHabitButtons()
-
-	ui.jumpXPBarToggle:SetScript("OnClick", function()
-		EnsureDB()
-		local shown = GetJumpXPBarSaved().shown
-		SetJumpXPBarShown(not shown)
+	-- Single Announce button (channel picked in a dialog).
+	local announceBtn = CreateFrame("Button", nil, habitMain, "UIPanelButtonTemplate")
+	announceBtn:SetSize(120, 22)
+	announceBtn:SetPoint("BOTTOM", 0, 12)
+	announceBtn:SetText("Announce")
+	announceBtn:SetScript("OnClick", function()
+		ns.ShowAnnounceDialog()
 	end)
-	announceSay:SetScript("OnClick", function()
-		AnnounceStatus("SAY")
-	end)
-	announceGuild:SetScript("OnClick", function()
-		if not IsInGuild() then
-			DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH:|r You are not in a guild.")
-			return
-		end
-		AnnounceStatus("GUILD")
-	end)
-	UpdateJumpXPBarToggleLabel()
+	ui.announceBtn = announceBtn
 
-	-- Habit Statistics subview
-	local habitStats = CreateFrame("Frame", nil, habit)
-	habitStats:SetAllPoints()
-	habitStats:Hide()
-	ui.habitStats = habitStats
+	-- Stats tab (statistics + nested Levels table)
+	local statsPage = CreateFrame("Frame", nil, content)
+	statsPage:SetAllPoints()
+	statsPage:Hide()
+	ui.pages.stats = statsPage
 
-	local backBtn = CreateFrame("Button", nil, habitStats, "UIPanelButtonTemplate")
-	backBtn:SetSize(60, 20)
-	backBtn:SetPoint("TOPLEFT", 6, -6)
-	backBtn:SetText("Back")
-	backBtn:SetScript("OnClick", function()
-		ShowHabitView("main")
+	local statsMain = CreateFrame("Frame", nil, statsPage)
+	statsMain:SetAllPoints()
+	ui.statsMain = statsMain
+
+	local levelsBtn = CreateFrame("Button", nil, statsMain, "UIPanelButtonTemplate")
+	levelsBtn:SetSize(72, 20)
+	levelsBtn:SetPoint("TOPRIGHT", -6, -6)
+	levelsBtn:SetText("Levels")
+	levelsBtn:SetScript("OnClick", function()
+		ns.ShowStatsView("levels")
 		if panel then
 			panel:Update()
 		end
 	end)
-	ui.habitStatsBack = backBtn
 
-	local statsTitle = habitStats:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	local statsTitle = statsMain:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	statsTitle:SetPoint("TOP", 0, -8)
 	statsTitle:SetText("Statistics")
 	statsTitle:SetTextColor(1, 0.82, 0)
 
-	local statsDivider = habitStats:CreateTexture(nil, "ARTWORK")
+	local statsDivider = statsMain:CreateTexture(nil, "ARTWORK")
 	statsDivider:SetHeight(1)
 	statsDivider:SetColorTexture(0.55, 0.45, 0.15, 0.55)
-	statsDivider:SetPoint("LEFT", habitStats, "LEFT", 16, 0)
-	statsDivider:SetPoint("RIGHT", habitStats, "RIGHT", -16, 0)
+	statsDivider:SetPoint("LEFT", statsMain, "LEFT", 16, 0)
+	statsDivider:SetPoint("RIGHT", statsMain, "RIGHT", -16, 0)
 	statsDivider:SetPoint("TOP", statsTitle, "BOTTOM", 0, -10)
 
 	local prevStatValue = nil
 	local function StatsRow(anchor, yOff, labelText)
-		local label, value = HabitStatRow(habitStats, anchor, yOff)
+		local label, value = HabitStatRow(statsMain, anchor, yOff)
 		label:SetText(labelText)
 		value:ClearAllPoints()
 		if prevStatValue then
@@ -4094,17 +3941,36 @@ local function BuildPanel()
 	ui.statFeatsLabel, ui.statFeats = StatsRow(ui.statLifeActivityLabel, -10, "Feats unlocked")
 	ui.statLastJumpLabel, ui.statLastJump = StatsRow(ui.statFeatsLabel, -10, "Time since last jump")
 
-	ShowHabitView("main")
-
-	-- Levels page
-	local levels = CreateFrame("Frame", nil, content)
+	local levels = CreateFrame("Frame", nil, statsPage)
 	levels:SetAllPoints()
 	levels:Hide()
-	ui.pages.levels = levels
-	local _, levelScroll, levelChild = CreateScrollArea(levels)
+	ui.statsLevels = levels
+
+	local levelsBack = CreateFrame("Button", nil, levels, "UIPanelButtonTemplate")
+	levelsBack:SetSize(60, 20)
+	levelsBack:SetPoint("TOPLEFT", 6, -6)
+	levelsBack:SetText("Back")
+	levelsBack:SetScript("OnClick", function()
+		ns.ShowStatsView("main")
+		if panel then
+			panel:Update()
+		end
+	end)
+
+	local levelsTitle = levels:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	levelsTitle:SetPoint("TOP", 0, -8)
+	levelsTitle:SetText("Levels")
+	levelsTitle:SetTextColor(1, 0.82, 0)
+
+	local levelsWrap, levelScroll, levelChild = ns.CreateScrollArea(levels)
+	levelsWrap:ClearAllPoints()
+	levelsWrap:SetPoint("TOPLEFT", 4, -32)
+	levelsWrap:SetPoint("BOTTOMRIGHT", -4, 4)
 	ui.levelScroll = levelScroll
 	ui.levelChild = levelChild
-	BuildLevelRows(levelChild)
+	ns.BuildLevelRows(levelChild)
+
+	ns.ShowStatsView("main")
 
 	-- Achievements page
 	local achieves = CreateFrame("Frame", nil, content)
@@ -4115,18 +3981,33 @@ local function BuildPanel()
 	ui.featBack = CreateFrame("Button", nil, achieves, "UIPanelButtonTemplate")
 	ui.featBack:SetSize(56, 20)
 	ui.featBack:SetPoint("TOPLEFT", 8, -12)
-	ui.featBack:SetText("< Back")
+	ui.featBack:SetText("Back")
 	ui.featBack:Hide()
 	ui.featBack:SetScript("OnClick", function()
 		ui.featView = "categories"
-		PlayUISound("IG_CHARACTER_INFO_TAB", 841)
-		UpdateAchievements()
+		ns.PlayUISound("IG_CHARACTER_INFO_TAB", 841)
+		ns.UpdateAchievements()
 	end)
 
-	ui.achSummary = achieves:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	ui.achSummary:SetPoint("TOPLEFT", 12, -16)
+	-- Flat gold diamond (rotated square): SVG-style, not a painted icon.
+	ui.achSummaryIcon = CreateFrame("Frame", nil, achieves)
+	ui.achSummaryIcon:SetSize(14, 14)
+	ui.achSummaryIcon:SetPoint("TOPLEFT", 12, -14)
+	local diamond = ui.achSummaryIcon:CreateTexture(nil, "ARTWORK")
+	diamond:SetTexture("Interface\\Buttons\\WHITE8X8")
+	diamond:SetSize(9, 9)
+	diamond:SetPoint("CENTER", 0, 0)
+	diamond:SetVertexColor(1, 0.82, 0, 1)
+	if diamond.SetRotation then
+		diamond:SetRotation(math.rad(45))
+	end
+	ui.achSummaryIcon.tex = diamond
 
-	local achWrap, _, achChild = CreateScrollArea(achieves)
+	ui.achSummary = achieves:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	ui.achSummary:SetPoint("LEFT", ui.achSummaryIcon, "RIGHT", 6, 0)
+	ui.achSummary:SetTextColor(1, 0.82, 0)
+
+	local achWrap, _, achChild = ns.CreateScrollArea(achieves)
 	achWrap:SetPoint("TOPLEFT", 4, -40)
 	-- Leave room for the reset button only when local DEV_TOOLS is on.
 	achWrap:SetPoint("BOTTOMRIGHT", -4, DEV_TOOLS and 32 or 4)
@@ -4139,7 +4020,7 @@ local function BuildPanel()
 		resetAch:SetHeight(22)
 		resetAch:SetText("Reset feats (testing)")
 		resetAch:SetScript("OnClick", function()
-			ResetAchievements()
+			ns.ResetAchievements()
 		end)
 	end
 
@@ -4149,7 +4030,7 @@ local function BuildPanel()
 	guild:Hide()
 	ui.pages.guild = guild
 
-	local boardWrap, _, boardChild = CreateScrollArea(guild)
+	local boardWrap, _, boardChild = ns.CreateScrollArea(guild)
 	ui.boardChild = boardChild
 
 	local boardHeaderRank = boardChild:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
@@ -4183,8 +4064,8 @@ local function BuildPanel()
 	refresh:SetHeight(22)
 	refresh:SetText("Refresh guild scores")
 	refresh:SetScript("OnClick", function()
-		RequestGuildScores()
-		UpdateLeaderboard()
+		ns.RequestGuildScores()
+		ns.UpdateLeaderboard()
 	end)
 
 	boardWrap:SetPoint("TOPLEFT", 4, -4)
@@ -4208,8 +4089,8 @@ local function BuildPanel()
 	soundCheckLabel:SetPoint("LEFT", soundCheck, "RIGHT", 4, 1)
 	soundCheckLabel:SetText("Enable sounds")
 	soundCheck:SetScript("OnClick", function(self)
-		EnsureDB()
-		AJHDB.soundsEnabled = not not self:GetChecked()
+		ns.EnsureDB()
+		ns.DB().soundsEnabled = not not self:GetChecked()
 	end)
 	ui.soundCheck = soundCheck
 
@@ -4220,13 +4101,25 @@ local function BuildPanel()
 	announceCheckLabel:SetPoint("LEFT", announceCheck, "RIGHT", 4, 1)
 	announceCheckLabel:SetText("Auto announce feats to guild")
 	announceCheck:SetScript("OnClick", function(self)
-		EnsureDB()
-		AJHDB.autoAnnounce = not not self:GetChecked()
+		ns.EnsureDB()
+		ns.DB().autoAnnounce = not not self:GetChecked()
 	end)
 	ui.announceCheck = announceCheck
 
+	local xpBarCheck = CreateFrame("CheckButton", nil, settings, "UICheckButtonTemplate")
+	xpBarCheck:SetPoint("TOPLEFT", announceCheck, "BOTTOMLEFT", 0, -6)
+	xpBarCheck:SetSize(26, 26)
+	local xpBarCheckLabel = settings:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	xpBarCheckLabel:SetPoint("LEFT", xpBarCheck, "RIGHT", 4, 1)
+	xpBarCheckLabel:SetText("Show Jump XP bar")
+	xpBarCheck:SetScript("OnClick", function(self)
+		ns.EnsureDB()
+		ns.SetJumpXPBarShown(not not self:GetChecked())
+	end)
+	ui.jumpXPBarCheck = xpBarCheck
+
 	local volumeLabel = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	volumeLabel:SetPoint("TOPLEFT", 24, -128)
+	volumeLabel:SetPoint("TOPLEFT", 24, -156)
 	volumeLabel:SetText("Sound volume")
 	ui.soundVolumeLabel = volumeLabel
 
@@ -4251,8 +4144,8 @@ local function BuildPanel()
 		bg:SetPoint("TOPLEFT", 0, 0)
 		bg:SetPoint("BOTTOMRIGHT", 0, 0)
 	end
-	volumeSlider:SetPoint("TOPLEFT", 28, -160)
-	volumeSlider:SetPoint("TOPRIGHT", -28, -160)
+	volumeSlider:SetPoint("TOPLEFT", 28, -188)
+	volumeSlider:SetPoint("TOPRIGHT", -28, -188)
 	volumeSlider:SetHeight(16)
 	volumeSlider:SetMinMaxValues(0, 100)
 	volumeSlider:SetValueStep(1)
@@ -4260,9 +4153,9 @@ local function BuildPanel()
 		volumeSlider:SetObeyStepOnDrag(true)
 	end
 	volumeSlider:SetScript("OnValueChanged", function(self, value)
-		EnsureDB()
+		ns.EnsureDB()
 		value = math.floor(value + 0.5)
-		AJHDB.soundVolume = value
+		ns.DB().soundVolume = value
 		if ui.soundVolumeValue then
 			ui.soundVolumeValue:SetText(tostring(value))
 		end
@@ -4288,36 +4181,39 @@ local function BuildPanel()
 	ui.soundVolumeSlider = volumeSlider
 
 	local volumeNote = settings:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	volumeNote:SetPoint("TOPLEFT", 24, -200)
-	volumeNote:SetPoint("TOPRIGHT", -24, -200)
+	volumeNote:SetPoint("TOPLEFT", 24, -228)
+	volumeNote:SetPoint("TOPRIGHT", -24, -228)
 	volumeNote:SetJustifyH("LEFT")
-	volumeNote:SetText("Volume 0 mutes AJH sounds. Manual Announce buttons on Habit are unchanged.")
+	volumeNote:SetText("Volume 0 mutes AJH sounds. Announce via Habit button or /ajh say|party|guild.")
 	volumeNote:SetTextColor(0.7, 0.7, 0.7)
 
 	panel:SetScript("OnShow", function()
-		PlayUISound("IG_CHARACTER_INFO_OPEN", 839)
+		ns.PlayUISound("IG_CHARACTER_INFO_OPEN", 839)
 		panel:Update()
-		SyncStatsTicker()
+		ns.SyncStatsTicker()
 	end)
 	panel:SetScript("OnHide", function()
-		PlayUISound("IG_CHARACTER_INFO_CLOSE", 840)
-		StopStatsTicker()
+		ns.PlayUISound("IG_CHARACTER_INFO_CLOSE", 840)
+		ns.StopStatsTicker()
 	end)
 
 	function panel:Update()
-		EnsureDB()
-		EnsureSessionClock()
-		FlushPlayTime()
-		local xp = AJHDB.xp
-		local jumps = AJHDB.jumps
-		local level = GetLevel(xp)
+		local db = ns.EnsureDB()
+		if not db then
+			return
+		end
+		ns.EnsureSessionClock()
+		ns.FlushPlayTime()
+		local xp = db.xp
+		local jumps = db.jumps
+		local level = ns.GetLevel(xp)
 
 		ui.level:SetText(tostring(level))
-		ui.jumpValue:SetText(FormatNumber(jumps))
-		UpdateLevelRows(level)
+		ui.jumpValue:SetText(ns.FormatNumber(jumps))
+		ns.UpdateLevelRows(level)
 
-		local xpGain = GetJumpXPGain()
-		if HasCampBenefit() then
+		local xpGain = ns.GetJumpXPGain()
+		if ns.HasCampBenefit() then
 			ui.rateValue:SetText(string.format("%d (Camp x%d)", xpGain, CAMP_XP_MULTIPLIER))
 			ui.rateValue:SetTextColor(0.1, 1, 0.1, 1)
 		else
@@ -4330,7 +4226,7 @@ local function BuildPanel()
 			ui.bar:SetValue(1)
 			ui.barText:SetText("Jump Habit MAX")
 			ui.xpDetail:SetText("RuneScape curve - level 99")
-			ui.xpValue:SetText(FormatNumber(xp - xpForLevel[MAX_LEVEL]))
+			ui.xpValue:SetText(ns.FormatNumber(xp - xpForLevel[MAX_LEVEL]))
 			ui.nextLabel:SetText("XP to next level")
 			ui.nextValue:SetText("-")
 		else
@@ -4345,52 +4241,52 @@ local function BuildPanel()
 			-- Same label style as profession skill bars: Name current/max
 			ui.barText:SetText(string.format(
 				"Jump Habit %s/%s",
-				FormatNumber(intoLevel),
-				FormatNumber(needed)
+				ns.FormatNumber(intoLevel),
+				ns.FormatNumber(needed)
 			))
 			ui.xpDetail:SetText(string.format(
 				"%d%%  -  %s until level %d",
 				math.min(99, math.floor(pct * 100)),
-				FormatNumber(remaining),
+				ns.FormatNumber(remaining),
 				level + 1
 			))
-			ui.xpValue:SetText(FormatNumber(intoLevel))
+			ui.xpValue:SetText(ns.FormatNumber(intoLevel))
 			ui.nextLabel:SetText("XP to next level")
-			ui.nextValue:SetText(FormatNumber(remaining))
+			ui.nextValue:SetText(ns.FormatNumber(remaining))
 		end
 
-		if activeTab == "habit" and ui.habitView == "stats" and ui.statSessionJumps then
+		if activeTab == "stats" and ui.statsView == "main" and ui.statSessionJumps then
 			local now = GetTime()
-			local elapsed = math.max(1, CurrentSessionElapsed())
+			local elapsed = math.max(1, ns.CurrentSessionElapsed())
 			local perMin = sessionJumps * 60 / elapsed
 			local perHr = sessionJumps * 3600 / elapsed
-			local recent = CountJumpsInWindow(300)
+			local recent = ns.CountJumpsInWindow(300)
 			local recentPerMin = recent / 5
-			local best = AJHDB.sessionJumpHigh or 0
+			local best = ns.DB().sessionJumpHigh or 0
 			if sessionJumps > best then
 				best = sessionJumps
 			end
-			local featEarned = CountOwnAchievements()
+			local featEarned = ns.CountOwnAchievements()
 			local featTotal = #ACHIEVEMENTS
-			local lifePlay = LifetimePlayTime()
+			local lifePlay = ns.LifetimePlayTime()
 			local sessionJumpSec = sessionJumps * JUMP_ACTIVITY_SEC
-			local lifeJumpSec = LifetimeJumpActivityTime()
+			local lifeJumpSec = ns.LifetimeJumpActivityTime()
 
 			if best > 0 then
 				local pctOfBest = math.floor((sessionJumps / best) * 100 + 0.5)
-				ui.statSessionJumps:SetText(string.format("%s (%d%%)", FormatNumber(sessionJumps), pctOfBest))
-				ui.statSessionHigh:SetText(FormatNumber(best))
+				ui.statSessionJumps:SetText(string.format("%s (%d%%)", ns.FormatNumber(sessionJumps), pctOfBest))
+				ui.statSessionHigh:SetText(ns.FormatNumber(best))
 			else
-				ui.statSessionJumps:SetText(FormatNumber(sessionJumps))
-				ui.statSessionHigh:SetText("—")
+				ui.statSessionJumps:SetText(ns.FormatNumber(sessionJumps))
+				ui.statSessionHigh:SetText("?")
 			end
-			ui.statSessionTime:SetText(FormatDuration(elapsed))
-			ui.statSessionActivity:SetText(FormatJumpIdlePct(sessionJumpSec, elapsed))
-			ui.statSessionRate:SetText(string.format("%.1f/min  ·  %.0f/hr", perMin, perHr))
+			ui.statSessionTime:SetText(ns.FormatDuration(elapsed))
+			ui.statSessionActivity:SetText(ns.FormatJumpIdlePct(sessionJumpSec, elapsed))
+			ui.statSessionRate:SetText(string.format("%.1f/min  ?  %.0f/hr", perMin, perHr))
 			ui.statRecentRate:SetText(string.format("%.1f/min", recentPerMin))
-			ui.statLifeJumps:SetText(FormatNumber(jumps))
+			ui.statLifeJumps:SetText(ns.FormatNumber(jumps))
 			ui.statLifeLevel:SetText(tostring(level))
-			ui.statLifeActivity:SetText(FormatJumpIdlePct(lifeJumpSec, lifePlay))
+			ui.statLifeActivity:SetText(ns.FormatJumpIdlePct(lifeJumpSec, lifePlay))
 			if featTotal > 0 then
 				local featPct = math.floor((featEarned / featTotal) * 100 + 0.5)
 				ui.statFeats:SetText(string.format("%d / %d (%d%%)", featEarned, featTotal, featPct))
@@ -4398,37 +4294,38 @@ local function BuildPanel()
 				ui.statFeats:SetText(string.format("%d / %d", featEarned, featTotal))
 			end
 			if lastAcceptedJumpTime > 0 then
-				ui.statLastJump:SetText(FormatDuration(now - lastAcceptedJumpTime))
+				ui.statLastJump:SetText(ns.FormatDuration(now - lastAcceptedJumpTime))
 			else
-				ui.statLastJump:SetText("—")
+				ui.statLastJump:SetText("?")
 			end
 		end
 
 		if activeTab == "settings" and ui.soundCheck then
-			ui.soundCheck:SetChecked(AJHDB.soundsEnabled ~= false)
+			ui.soundCheck:SetChecked(ns.DB().soundsEnabled ~= false)
 			if ui.announceCheck then
-				ui.announceCheck:SetChecked(AJHDB.autoAnnounce ~= false)
+				ui.announceCheck:SetChecked(not not ns.DB().autoAnnounce)
 			end
-			local vol = ToNumberOr(AJHDB.soundVolume, 100) or 100
+			ns.UpdateJumpXPBarToggleLabel()
+			local vol = ns.ToNumberOr(ns.DB().soundVolume, 100) or 100
 			ui.soundVolumeSlider:SetValue(vol)
 			ui.soundVolumeValue:SetText(tostring(math.floor(vol + 0.5)))
 		end
 
 		if activeTab == "guild" then
-			UpdateLeaderboard()
+			ns.UpdateLeaderboard()
 		elseif activeTab == "achieves" then
-			UpdateAchievements()
+			ns.UpdateAchievements()
 		end
 
-		UpdateJumpXPBar()
+		ns.UpdateJumpXPBar()
 	end
 
-	SetTab("habit", true)
+	ns.SetTab("habit", true)
 	return panel
 end
 
-local function TogglePanel()
-	local f = BuildPanel()
+function ns.TogglePanel()
+	local f = ns.BuildPanel()
 	if f:IsShown() then
 		f:Hide()
 	else
@@ -4439,24 +4336,23 @@ end
 
 -- Slash / binding entry point (Bindings.xml auto-loads; must not be in TOC).
 function AJH_TogglePanel()
-	TogglePanel()
+	ns.TogglePanel()
 end
 
 local minimapButton
 local minimapDragging = false
 
-local function UpdateMinimapButtonPosition()
+function ns.UpdateMinimapButtonPosition()
 	if not minimapButton then
 		return
 	end
-	-- Do NOT call EnsureDB here — position reads AJHDB if present; UI build
-	-- waits until VARIABLES_LOADED so we never invent an empty DB early.
-	local angle = math.rad((type(AJHDB) == "table" and AJHDB.minimapPos) or 210)
+	-- Do NOT call EnsureDB here ? position reads AJHSaved if present.
+	local angle = math.rad((type(AJHSaved) == "table" and ns.DB().minimapPos) or 210)
 	local radius = (Minimap:GetWidth() / 2) + 5
 	minimapButton:SetPoint("CENTER", Minimap, "CENTER", math.cos(angle) * radius, math.sin(angle) * radius)
 end
 
-local function BuildMinimapButton()
+function ns.BuildMinimapButton()
 	if minimapButton then
 		return minimapButton
 	end
@@ -4482,11 +4378,11 @@ local function BuildMinimapButton()
 	overlay:SetPoint("TOPLEFT")
 
 	btn:SetScript("OnEnter", function(self)
-		EnsureDB()
+		ns.EnsureDB()
 		GameTooltip:SetOwner(self, "ANCHOR_LEFT")
 		GameTooltip:AddLine("Archindula's Jump Habit", C.accent[1], C.accent[2], C.accent[3])
 		GameTooltip:AddLine(
-			string.format("Level %d  -  %s jumps", GetLevel(AJHDB.xp), FormatNumber(AJHDB.jumps)),
+			string.format("Level %d  -  %s jumps", ns.GetLevel(ns.DB().xp), ns.FormatNumber(ns.DB().jumps)),
 			1, 1, 1
 		)
 		GameTooltip:AddLine("Click to open", 0.6, 0.6, 0.6)
@@ -4501,7 +4397,7 @@ local function BuildMinimapButton()
 		if minimapDragging then
 			return
 		end
-		TogglePanel()
+		ns.TogglePanel()
 	end)
 
 	btn:SetScript("OnDragStart", function(self)
@@ -4512,9 +4408,9 @@ local function BuildMinimapButton()
 			local cx, cy = GetCursorPosition()
 			local scale = Minimap:GetEffectiveScale()
 			cx, cy = cx / scale, cy / scale
-			EnsureDB()
-			AJHDB.minimapPos = math.deg(math.atan2(cy - my, cx - mx))
-			UpdateMinimapButtonPosition()
+			ns.EnsureDB()
+			ns.DB().minimapPos = math.deg(math.atan2(cy - my, cx - mx))
+			ns.UpdateMinimapButtonPosition()
 		end)
 	end)
 
@@ -4526,103 +4422,72 @@ local function BuildMinimapButton()
 	end)
 
 	minimapButton = btn
-	UpdateMinimapButtonPosition()
+	ns.UpdateMinimapButtonPosition()
 	return btn
 end
 
 local JUMP_COOLDOWN = JUMP_ACTIVITY_SEC
 local lastJumpTime = 0
 
-local function StartLateLoadWatch()
-	if lateLoadTicker then
-		return
-	end
-	local tries = 0
-	lateLoadTicker = C_Timer.NewTicker(0.5, function(self)
-		tries = tries + 1
-		local before = type(AJHDB) == "table" and ToNumberOr(AJHDB.jumps, 0) or 0
-		local rawMax = MaxProgressInAccountSV()
-		if rawMax > before then
-			EnsureDB()
-			if panel and panel:IsShown() then
-				panel:Update()
-			else
-				UpdateJumpXPBar()
-			end
-			if DIAG_ENABLED then
-				DiagChat(string.format(
-					"late-load hydrate before=%d rawMax=%d after=%d",
-					before,
-					rawMax,
-					ToNumberOr(AJHDB and AJHDB.jumps, 0)
-				))
-			end
-		end
-		if tries >= 20 then
-			self:Cancel()
-			lateLoadTicker = nil
-		end
-	end)
-end
-
-local function OnJump()
+function ns.OnJump()
 	local now = GetTime()
 	if now - lastJumpTime < JUMP_COOLDOWN then
 		return
 	end
 	lastJumpTime = now
-	RecordSessionJump(now)
+	local idleGap = (lastAcceptedJumpTime > 0) and (now - lastAcceptedJumpTime) or 0
+	ns.RecordSessionJump(now)
 
-	EnsureDB()
-	NoteSessionJumpHigh()
-	NoteJumpActivity()
-	local oldLevel = GetLevel(AJHDB.xp)
-	AJHDB.jumps = AJHDB.jumps + 1
-	AJHDB.xp = AJHDB.xp + GetJumpXPGain()
-	CommitFloor()
-	PersistProgressMirror()
-	local newLevel = GetLevel(AJHDB.xp)
-	if newLevel > oldLevel then
-		AnnounceLevelUp(newLevel)
-		BroadcastScore()
-	elseif AJHDB.jumps % 25 == 0 then
-		BroadcastScore()
+	local db = ns.EnsureDB()
+	if not db then
+		return
 	end
-	if CheckAchievementsOnJump() and panel and panel:IsShown() and activeTab == "achieves" then
-		UpdateAchievements()
+	local dayStreak = ns.NoteJumpDay()
+	ns.NoteSessionJumpHigh()
+	ns.NoteJumpActivity()
+	local oldLevel = ns.GetLevel(db.xp)
+	db.jumps = db.jumps + 1
+	db.xp = db.xp + ns.GetJumpXPGain()
+	local newLevel = ns.GetLevel(db.xp)
+	if newLevel > oldLevel then
+		ns.AnnounceLevelUp(newLevel)
+		ns.BroadcastScore()
+	elseif db.jumps % 25 == 0 then
+		ns.BroadcastScore()
+	end
+	if ns.CheckAchievementsOnJump({ idleGap = idleGap, dayStreak = dayStreak }) and panel and panel:IsShown() and activeTab == "achieves" then
+		ns.UpdateAchievements()
 	end
 	if panel and panel:IsShown() then
 		panel:Update()
 	else
-		UpdateJumpXPBar()
+		ns.UpdateJumpXPBar()
 	end
 end
 
 local uiBuilt = false
 local jumpHookInstalled = false
 
--- Build UI / jump hook only AFTER VARIABLES_LOADED (or on PLAYER_LOGIN if
--- VARIABLES_LOADED was missed). BuildJumpXPBar → EnsureDB must not run at
--- ADDON_LOADED or it invents AJHDB={} before Forever injects SavedVariables.
-local function EnsureUIBuilt()
+-- Build UI on PLAYER_LOGIN, after SavedVariables are loaded.
+function ns.EnsureUIBuilt()
 	if uiBuilt then
 		return
 	end
 	uiBuilt = true
-	EnsureSessionClock()
-	BuildPanel()
-	BuildJumpXPBar()
-	BuildMinimapButton()
+	ns.EnsureSessionClock()
+	ns.BuildPanel()
+	ns.BuildJumpXPBar()
+	ns.BuildMinimapButton()
 	if not jumpHookInstalled then
 		jumpHookInstalled = true
-		hooksecurefunc("JumpOrAscendStart", OnJump)
+		hooksecurefunc("JumpOrAscendStart", ns.OnJump)
 	end
-	RefreshCampBenefit()
+	ns.RefreshCampBenefit()
 	-- Keep lifetime play time moving even when the panel is closed.
 	if C_Timer and C_Timer.NewTicker and not playTimeTicker then
 		playTimeTicker = C_Timer.NewTicker(5, function()
-			if type(AJHDB) == "table" then
-				FlushPlayTime()
+			if type(AJHSaved) == "table" then
+				ns.FlushPlayTime()
 			end
 		end)
 	end
@@ -4633,7 +4498,6 @@ loader:RegisterEvent("ADDON_LOADED")
 loader:RegisterEvent("PLAYER_LOGIN")
 loader:RegisterEvent("PLAYER_LOGOUT")
 loader:RegisterEvent("PLAYER_ENTERING_WORLD")
-loader:RegisterEvent("VARIABLES_LOADED")
 loader:RegisterUnitEvent("UNIT_AURA", "player")
 loader:RegisterEvent("CHAT_MSG_ADDON")
 loader:SetScript("OnEvent", function(self, event, ...)
@@ -4642,151 +4506,93 @@ loader:SetScript("OnEvent", function(self, event, ...)
 		if name ~= ADDON_NAME then
 			return
 		end
-		-- Snapshot ONLY — no EnsureDB, no UI build. Forever has not injected
-		-- account SavedVariables yet; BuildJumpXPBar→EnsureDB would invent
-		-- AJHDB={} and poison the session (diag: DB=table jumps=0).
-		diagRawAtAddonLoaded = DiagSnapshot("ADDON_LOADED/raw")
-		SyncSavedVarsFromGlobal()
-		DebugDump("ADDON_LOADED (raw client SV, before bind)")
 		if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
 			C_ChatInfo.RegisterAddonMessagePrefix(ADDON_PREFIX)
 		elseif RegisterAddonMessagePrefix then
 			RegisterAddonMessagePrefix(ADDON_PREFIX)
 		end
-	elseif event == "VARIABLES_LOADED" then
-		-- Forever injects account SavedVariables HERE (not at ADDON_LOADED).
-		-- Character AJHDB may already exist; Account/Floor appear now.
-		variablesLoadedFired = true
-		SyncSavedVarsFromGlobal()
-		DebugDump("VARIABLES_LOADED (before bind)")
-		local healed = HealProgressOnLogin()
-		DebugDump("VARIABLES_LOADED (after bind)")
-		EnsureUIBuilt()
-		if healed and DEFAULT_CHAT_FRAME then
-			DEFAULT_CHAT_FRAME:AddMessage(string.format(
-				"|cff88ff88AJH:|r Recovered your Jump Habit progress (%s jumps).",
-				FormatNumber(AJHDB.jumps)
-			))
-		end
-		if panel then
-			panel:Update()
-		end
-		UpdateJumpXPBar()
 	elseif event == "PLAYER_LOGIN" then
-		-- Safety: allow EnsureDB if VARIABLES_LOADED never fired on this client.
-		variablesLoadedFired = true
-		SyncSavedVarsFromGlobal()
-		-- Bind again in case anything arrived between VARIABLES_LOADED and login.
-		local healed = HealProgressOnLogin()
-		diagAfterBind = DiagSnapshot("PLAYER_LOGIN/afterEnsureDB")
-		DebugDump("PLAYER_LOGIN (after bind/hydrate)")
-		EnsureUIBuilt()
-		-- Quiet late catch if Forever injects SV after login (no chat spam).
-		C_Timer.After(2, function()
-			SyncSavedVarsFromGlobal()
-			AbsorbAccountStoreFromAJHDB()
-			RestoreProgressMirror()
-			if MaxProgressInAccountSV() > ToNumberOr(AJHDB and AJHDB.jumps, 0) then
-				EnsureDB()
-				PersistProgressMirror()
-				if panel then
-					panel:Update()
-				end
-			end
-		end)
-		StartLateLoadWatch()
-		if healed then
-			DEFAULT_CHAT_FRAME:AddMessage(string.format(
-				"|cff88ff88AJH:|r Recovered your Jump Habit progress (%s jumps).",
-				FormatNumber(AJHDB.jumps)
-			))
-		else
+		svReady = true
+		local db = ns.EnsureDB()
+		diagAfterBind = ns.DiagSnapshot("PLAYER_LOGIN")
+		ns.DebugDump("PLAYER_LOGIN")
+		ns.EnsureUIBuilt()
+		if type(AJHSaved) == "table" then
 			DEFAULT_CHAT_FRAME:AddMessage(string.format(
 				"|cff88ff88AJH:|r Loaded %s jumps (%s XP).",
-				FormatNumber(AJHDB.jumps),
-				FormatNumber(AJHDB.xp)
+				ns.FormatNumber(ns.DB().jumps),
+				ns.FormatNumber(ns.DB().xp)
+			))
+		elseif db then
+			DEFAULT_CHAT_FRAME:AddMessage(string.format(
+				"|cffffcc00AJH:|r Starting temporary session at %s jumps (save file not loaded).",
+				ns.FormatNumber(db.jumps)
 			))
 		end
-		RefreshCampBenefit()
+		-- Forever often fails to load account SavedVariables after /reload or a
+		-- full restart. We never invent AJHSaved={} so a good WTF file is kept.
+		DEFAULT_CHAT_FRAME:AddMessage(
+			"|cffffcc00AJH:|r Forever bug ? addon saves sometimes never load after /reload or a full restart (WTF file can still be fine). AJH will not overwrite your save with zeros while that happens."
+		)
+		ns.RefreshCampBenefit()
 		if panel then
 			panel:Update()
 		end
-		RestoreJumpXPBarFromSaved()
-		C_Timer.After(0.5, RestoreJumpXPBarFromSaved)
+		ns.		RestoreJumpXPBarFromSaved()
+		if C_Timer and C_Timer.After then
+			C_Timer.After(0.5, ns.RestoreJumpXPBarFromSaved)
+			C_Timer.After(0.5, ns.TryLateSavedAdopt)
+			C_Timer.After(2, ns.TryLateSavedAdopt)
+			C_Timer.After(5, ns.TryLateSavedAdopt)
+			C_Timer.After(1, function()
+				if ns.EnsureDB() then
+					ns.CheckAchievementsOnJump({ dayStreak = ns.NoteJumpDay() })
+				end
+			end)
+		end
 	elseif event == "PLAYER_LOGOUT" then
-		diagAtLogout = DiagSnapshot("PLAYER_LOGOUT/beforeEnsureDB")
+		diagAtLogout = ns.DiagSnapshot("PLAYER_LOGOUT")
 		if DIAG_ENABLED then
-			DiagPrintSnapshot(diagAtLogout, true)
+			ns.DiagPrintSnapshot(diagAtLogout, true)
 		end
-		-- Forever ignores TOC renames for SAVE: it keeps writing AJHAccount
-		-- (and AJHFloor when present). Never rename/nil those on logout when
-		-- we have real progress. Empty account tables must not be serialized.
-		local hasProgress = MaxProgressInAccountSV() > 0
-			or (type(AJHDB) == "table" and ToNumberOr(AJHDB.jumps, 0) > 0)
-		if type(AJHAccount) == "table" and hasProgress then
-			EnsureDB()
-			FlushPlayTime()
-			if type(AJHDB) == "table" and ToNumberOr(AJHDB.jumps, 0) > 0 then
-				CommitFloor()
-			end
-			-- Ensure AJHFloor exists so Forever's dual-var save stays valid.
-			if type(AJHFloor) ~= "table" then
-				AJHFloor = {}
-			end
-			if type(AJHAccount.__floor) == "table" then
-				AJHFloor.__best = AJHAccount.__floor
-				local key = PlayerKey()
-				local name = UnitName("player")
-				if key then
-					AJHFloor[key] = AJHAccount.__floor
-				end
-				if type(name) == "string" and name ~= "" then
-					AJHFloor[name] = AJHAccount.__floor
-				end
-			end
-			PersistProgressMirror()
-		elseif type(AJHAccount) == "table" and not hasProgress then
-			-- Blank in-memory account: drop it so Forever is less likely to
-			-- overwrite a richer WTF file with zeros.
-			AJHAccount = nil
-			AJHFloor = nil
-			if _G then
-				rawset(_G, "AJHAccount", nil)
-				rawset(_G, "AJHFloor", nil)
-			end
-		elseif DEFAULT_CHAT_FRAME and DEV_TOOLS then
-			DEFAULT_CHAT_FRAME:AddMessage(
-				"|cffff6666AJH:|r Account SV missing this session — skipping logout write to protect WTF."
-			)
+		-- Only flush into the real SavedVariable. If Forever never loaded it,
+		-- leave AJHSaved unset so the client does not write an empty table.
+		if type(AJHSaved) == "table" then
+			ns.EnsureDB()
+			ns.FlushPlayTime()
 		end
 		if DIAG_ENABLED then
-			local after = DiagSnapshot("PLAYER_LOGOUT/afterEnsureDB")
-			DiagPrintSnapshot(after, false)
-			DiagReport("logout")
+			ns.DiagReport("logout")
 		end
 	elseif event == "UNIT_AURA" then
-		if RefreshCampBenefit() and panel and panel:IsShown() then
+		if ns.RefreshCampBenefit() and panel and panel:IsShown() then
 			panel:Update()
 		end
 	elseif event == "PLAYER_ENTERING_WORLD" then
-		EnsureDB()
-		HealProgressOnLogin()
-		RefreshCampBenefit()
+		ns.TryLateSavedAdopt()
+		ns.EnsureDB()
+		ns.RefreshCampBenefit()
+		if panel then
+			panel:Update()
+		end
 		C_Timer.After(0, function()
-			if RefreshCampBenefit() and panel and panel:IsShown() then
+			ns.TryLateSavedAdopt()
+			if ns.RefreshCampBenefit() and panel and panel:IsShown() then
 				panel:Update()
 			end
 			-- Status bars are laid out by now; re-apply saved Jump XP bar layout.
-			RestoreJumpXPBarFromSaved()
+			ns.RestoreJumpXPBarFromSaved()
 		end)
-		C_Timer.After(1, RestoreJumpXPBarFromSaved)
-		C_Timer.After(3, BroadcastScore)
+		C_Timer.After(1, ns.RestoreJumpXPBarFromSaved)
+		C_Timer.After(1, ns.TryLateSavedAdopt)
+		C_Timer.After(3, ns.BroadcastScore)
+		C_Timer.After(3, ns.TryLateSavedAdopt)
 	elseif event == "CHAT_MSG_ADDON" then
 		local prefix, message, channel, sender = ...
 		if prefix ~= ADDON_PREFIX then
 			return
 		end
-		if not IsAjhAddonChannel(channel) then
+		if not ns.IsAjhAddonChannel(channel) then
 			lastGuildRecvNote = string.format("drop-chan prefix=%s chan=%s sender=%s", tostring(prefix), tostring(channel), tostring(sender))
 			return
 		end
@@ -4800,11 +4606,11 @@ loader:SetScript("OnEvent", function(self, event, ...)
 		if message == "R" then
 			if GetTime() - lastGuildReply > 2 then
 				lastGuildReply = GetTime()
-				BroadcastScore()
+				ns.BroadcastScore()
 			end
 		else
-			-- Y:jumps:achs:xp (feat count) — preferred with many location feats.
-			-- X:jumps:achMask:xp / S:jumps:achMask — legacy bitmask (capped).
+			-- Y:jumps:achs:xp (feat count) ? preferred with many location feats.
+			-- X:jumps:achMask:xp / S:jumps:achMask ? legacy bitmask (capped).
 			local jumps, achs, achMask, xp
 			jumps, achs, xp = message:match("^Y:(%d+):(%d+):(%d+)$")
 			if jumps then
@@ -4835,14 +4641,14 @@ loader:SetScript("OnEvent", function(self, event, ...)
 				return
 			end
 			local short = Ambiguate(sender, "short")
-			local myKey, myName = PlayerIdentity()
+			local myKey, myName = ns.PlayerIdentity()
 			local boardKey = Ambiguate(sender, "none") or sender
 			if myName and short == myName then
 				boardKey = myKey or boardKey
 			elseif myKey and boardKey == myKey then
 				boardKey = myKey
 			end
-			StoreScore(boardKey, short, jumps, achMask, xp, achs)
+			ns.StoreScore(boardKey, short, jumps, achMask, xp, achs)
 			if DEFAULT_CHAT_FRAME and (DEV_TOOLS or (panel and panel:IsShown() and activeTab == "guild")) then
 				-- One-line confirm when guild tab is open so we can see arrivals.
 				if DEV_TOOLS then
@@ -4855,7 +4661,7 @@ loader:SetScript("OnEvent", function(self, event, ...)
 				end
 			end
 			if panel and panel:IsShown() and activeTab == "guild" then
-				UpdateLeaderboard()
+				ns.UpdateLeaderboard()
 			end
 		end
 	end
@@ -4864,25 +4670,33 @@ SLASH_AJH1 = "/ajh"
 SLASH_AJH2 = "/jumphabit"
 SlashCmdList.AJH = function(msg)
 	msg = strtrim(msg or ""):lower()
-	if msg == "guild" or msg == "sync" then
-		EnsureDB()
+	if msg == "say" or msg == "party" or msg == "guild" or msg == "g" then
+		local channel = msg
+		if channel == "g" then
+			channel = "guild"
+		end
+		ns.AnnounceStatus(string.upper(channel))
+		return
+	end
+	if msg == "sync" then
+		ns.EnsureDB()
 		if GuildRoster then
 			pcall(GuildRoster)
 		end
-		RequestGuildScores()
-		UpdateLeaderboard()
+		ns.RequestGuildScores()
+		ns.UpdateLeaderboard()
 		local boardCount = 0
-		if type(AJHDB) == "table" and type(AJHDB.board) == "table" then
-			for _ in pairs(AJHDB.board) do
+		if type(AJHSaved) == "table" and type(ns.DB().board) == "table" then
+			for _ in pairs(ns.DB().board) do
 				boardCount = boardCount + 1
 			end
 		end
-		local online = IterOnlineGuildNames()
+		local online = ns.IterOnlineGuildNames()
 		local prefixOk = "?"
 		if C_ChatInfo and C_ChatInfo.IsAddonMessagePrefixRegistered then
 			prefixOk = tostring(C_ChatInfo.IsAddonMessagePrefixRegistered(ADDON_PREFIX))
 		end
-		DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH guild:|r")
+		DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH guild sync:|r")
 		DEFAULT_CHAT_FRAME:AddMessage("  inGuild=" .. tostring(IsInGuild()) .. " prefixReg=" .. prefixOk)
 		DEFAULT_CHAT_FRAME:AddMessage("  onlinePeers=" .. tostring(#online) .. " boardRows=" .. tostring(boardCount))
 		DEFAULT_CHAT_FRAME:AddMessage("  lastSend=" .. tostring(lastGuildSendNote))
@@ -4891,16 +4705,15 @@ SlashCmdList.AJH = function(msg)
 		if #online > 0 then
 			DEFAULT_CHAT_FRAME:AddMessage("  peers: " .. table.concat(online, ", "))
 		else
-			DEFAULT_CHAT_FRAME:AddMessage("  peers: (none online in roster — wait a second and /ajh guild again)")
+			DEFAULT_CHAT_FRAME:AddMessage("  peers: (none online in roster ? wait a second and /ajh sync again)")
 		end
 		return
 	end
 	if msg == "debug" or msg == "copy" then
-		SyncSavedVarsFromGlobal()
-		TryHydrateSavedVariablesFromWTF()
-		DebugDump("manual /ajh " .. msg)
-		ShowDebugCopyFrame(GetDebugLogText())
-		DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH:|r Debug window opened — Ctrl+A, Ctrl+C to copy.")
+		ns.EnsureDB()
+		ns.DebugDump("manual /ajh " .. msg)
+		ns.ShowDebugCopyFrame(ns.GetDebugLogText())
+		DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH:|r Debug window opened ? Ctrl+A, Ctrl+C to copy.")
 		return
 	end
 	if msg == "diag" or msg == "diag on" or msg == "diag off" or msg:match("^diag%s") then
@@ -4908,40 +4721,39 @@ SlashCmdList.AJH = function(msg)
 		arg = strtrim(arg)
 		if arg == "on" then
 			DIAG_ENABLED = true
-			DiagChat("auto diag ON")
+			ns.DiagChat("auto diag ON")
 			return
 		elseif arg == "off" then
 			DIAG_ENABLED = false
-			DiagChat("auto diag OFF")
+			ns.DiagChat("auto diag OFF")
 			return
 		end
-		-- Manual dump: snapshot now + verdict from login raw/bind.
-		DiagPrintSnapshot(DiagSnapshot("manual/now"), true)
+		ns.DiagPrintSnapshot(ns.DiagSnapshot("manual/now"), true)
 		if diagRawAtAddonLoaded then
-			DiagPrintSnapshot(diagRawAtAddonLoaded, true)
+			ns.DiagPrintSnapshot(diagRawAtAddonLoaded, true)
 		end
 		if diagAfterBind then
-			DiagPrintSnapshot(diagAfterBind, true)
+			ns.DiagPrintSnapshot(diagAfterBind, true)
 		end
-		DiagReport("manual")
+		ns.DiagReport("manual")
 		return
 	end
-	EnsureDB()
+	ns.EnsureDB()
 	if msg == "clear" or msg == "reset" then
-		ClearAccountProgress()
-		local key = PlayerIdentity()
-		if key and AJHDB.board then
-			AJHDB.board[key] = nil
+		ns.ClearAccountProgress()
+		local key = ns.PlayerIdentity()
+		if key and ns.DB().board then
+			ns.DB().board[key] = nil
 		end
-		BroadcastScore()
+		ns.BroadcastScore()
 		DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH:|r Jump count and XP reset.")
 		if panel and panel:IsShown() then
 			panel:Update()
 		else
-			UpdateJumpXPBar()
+			ns.UpdateJumpXPBar()
 		end
 	elseif msg == "where" then
-		local ctx = GetJumpContext()
+		local ctx = ns.GetJumpContext()
 		DEFAULT_CHAT_FRAME:AddMessage(string.format(
 			"|cff88ff88AJH:|r Zone: %s  |  Sub: %s  |  Mini: %s  |  Map: %s  |  Instance: %s",
 			ctx.zone ~= "" and ctx.zone or "?",
@@ -4950,7 +4762,14 @@ SlashCmdList.AJH = function(msg)
 			tostring(ctx.mapID or "?"),
 			ctx.instanceType
 		))
+	elseif msg == "help" then
+		DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH commands:|r")
+		DEFAULT_CHAT_FRAME:AddMessage("  /ajh ? open panel")
+		DEFAULT_CHAT_FRAME:AddMessage("  /ajh say | party | guild ? announce level & jumps")
+		DEFAULT_CHAT_FRAME:AddMessage("  /ajh sync ? refresh guild leaderboard")
+		DEFAULT_CHAT_FRAME:AddMessage("  /ajh where ? debug zone names")
+		DEFAULT_CHAT_FRAME:AddMessage("  /ajh clear ? reset jumps and XP")
 	else
-		TogglePanel()
+		ns.TogglePanel()
 	end
 end
