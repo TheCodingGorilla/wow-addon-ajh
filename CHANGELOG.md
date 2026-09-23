@@ -1,5 +1,9 @@
 ﻿# Changelog
 
+## 1.3.1
+
+- Fix CurseForge package: ship `Bindings.xml` again (Forever auto-loads it by filename; omitting it caused `Couldn't open .../Bindings.xml`). Still not listed in the TOC.
+
 ## 1.3.0
 
 **Feats expansion, Habit polish, and Forever-safe account saves**
