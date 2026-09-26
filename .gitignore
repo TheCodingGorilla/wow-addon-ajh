@@ -4,6 +4,7 @@ Thumbs.db
 .env
 *.env.local
 
+_recovery/
 _stage*/
 _cf_*.json
 _cmp*/
