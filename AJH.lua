@@ -1025,6 +1025,7 @@ function ns.GetJumpContext(extra)
 		inPlace = inPlace,
 		spotContains = spotContains,
 		matchesLocation = matchesLocation,
+		fromJump = not not extra.fromJump,
 		idleGap = tonumber(extra.idleGap) or 0,
 		dayStreak = tonumber(extra.dayStreak) or 0,
 		combat = UnitAffectingCombat and UnitAffectingCombat("player") or false,
@@ -1066,9 +1067,14 @@ function ns.MakeLocationFeat(loc, baseCategory, requireInstanceType)
 		baseCategory = baseCategory,
 		faction = loc.faction,
 		isLocation = true,
+		requiresJump = true,
 		name = loc.name,
 		desc = "Jump once in " .. loc.name .. ".",
 		test = function(ctx)
+			-- Location feats must only unlock on an accepted jump, never on login/zone enter.
+			if not ctx or not ctx.fromJump then
+				return false
+			end
 			if requireInstanceType and ctx.instanceType ~= requireInstanceType then
 				return false
 			end
@@ -1077,13 +1083,15 @@ function ns.MakeLocationFeat(loc, baseCategory, requireInstanceType)
 	}
 end
 
-function ns.MakeFeat(id, baseCategory, name, desc, test)
+function ns.MakeFeat(id, baseCategory, name, desc, test, opts)
+	opts = opts or {}
 	return {
 		id = id,
 		baseCategory = baseCategory,
 		name = name,
 		desc = desc,
 		test = test,
+		requiresJump = not not opts.requiresJump,
 	}
 end
 
@@ -1121,9 +1129,10 @@ end
 
 -- Non-location feats (habit / style / travel / social / collection / oddities).
 do
-	local function add(id, cat, name, desc, test)
-		ACHIEVEMENTS[#ACHIEVEMENTS + 1] = ns.MakeFeat(id, cat, name, desc, test)
+	local function add(id, cat, name, desc, test, opts)
+		ACHIEVEMENTS[#ACHIEVEMENTS + 1] = ns.MakeFeat(id, cat, name, desc, test, opts)
 	end
+	local JUMP = { requiresJump = true }
 
 	-- Milestone / habit
 	add("jumps_100", "milestone", "Century Hopper", "Reach 100 lifetime jumps.", function()
@@ -1149,13 +1158,13 @@ do
 	end)
 	add("streak_3", "milestone", "Three-Day Tick", "Jump on 3 consecutive calendar days.", function(ctx)
 		return (ctx.dayStreak or 0) >= 3
-	end)
+	end, JUMP)
 	add("streak_7", "milestone", "Weekly Legs", "Jump on 7 consecutive calendar days.", function(ctx)
 		return (ctx.dayStreak or 0) >= 7
-	end)
+	end, JUMP)
 	add("streak_30", "milestone", "Monthly Devotion", "Jump on 30 consecutive calendar days.", function(ctx)
 		return (ctx.dayStreak or 0) >= 30
-	end)
+	end, JUMP)
 	add("session_50", "milestone", "Warm-Up Crush", "Make 50 jumps in a single session.", function()
 		return sessionJumps >= 50
 	end)
@@ -1163,47 +1172,47 @@ do
 		return sessionJumps >= 200
 	end)
 
-	-- Style / situation
+	-- Style / situation (must be an accepted jump in that situation)
 	add("camp_jump", "style", "Camp Cadet", "Jump while Camp Benefit is active.", function(ctx)
 		return ctx.camp
-	end)
+	end, JUMP)
 	add("combat_jump", "style", "Fight Hop", "Jump while in combat.", function(ctx)
 		return ctx.combat
-	end)
+	end, JUMP)
 	add("mounted_jump", "style", "Saddle Skip", "Jump while mounted.", function(ctx)
 		return ctx.mounted
-	end)
+	end, JUMP)
 	add("swim_jump", "style", "Splash Hop", "Jump while swimming.", function(ctx)
 		return ctx.swimming
-	end)
+	end, JUMP)
 	add("indoor_jump", "style", "Ceiling Tester", "Jump while indoors.", function(ctx)
 		return ctx.indoors
-	end)
+	end, JUMP)
 	add("night_jump", "style", "Midnight Bounce", "Jump between 21:00 and 05:00.", function(ctx)
 		return ctx.night
-	end)
+	end, JUMP)
 
 	-- Travel / risk
 	add("taxi_jump", "travel", "Bird Brain", "Jump while on a flight path.", function(ctx)
 		return ctx.taxi
-	end)
+	end, JUMP)
 	add("transport_jump", "travel", "Deck Cadet", "Jump on a boat or zeppelin deck.", function(ctx)
 		return ctx.onTransport
-	end)
+	end, JUMP)
 	add("contested_jump", "travel", "Orange Zone", "Jump in a contested PvP zone.", function(ctx)
 		return ctx.contested
-	end)
+	end, JUMP)
 	add("ghost_jump", "travel", "Spectral Skip", "Jump while dead or as a ghost.", function(ctx)
 		return ctx.dead or ctx.ghost
-	end)
+	end, JUMP)
 
 	-- Social
 	add("party_jump", "social", "Group Bounce", "Jump while in a party.", function(ctx)
 		return ctx.grouped and not ctx.raid
-	end)
+	end, JUMP)
 	add("raid_jump", "social", "Raid Hop", "Jump while in a raid group.", function(ctx)
 		return ctx.raid
-	end)
+	end, JUMP)
 	add("announce_5", "social", "Guild Flex", "Announce your Jump Habit status 5 times.", function()
 		return (ns.DB().announceCount or 0) >= 5
 	end)
@@ -1223,7 +1232,7 @@ do
 			end
 		end
 		return false
-	end)
+	end, JUMP)
 
 	-- Collection / meta (after location feats so same-jump unlocks cascade)
 	add("meta_capitals", "collection", "Capital Circuit", "Jump in every capital city (yours and theirs).", function()
@@ -1250,19 +1259,19 @@ do
 	-- Oddities
 	add("ah_jump", "oddity", "Bid High", "Jump with the auction house open.", function(ctx)
 		return ctx.atAuction
-	end)
+	end, JUMP)
 	add("mail_jump", "oddity", "Postage Due", "Jump with the mailbox open.", function(ctx)
 		return ctx.atMail
-	end)
+	end, JUMP)
 	add("trainer_jump", "oddity", "Class Is in Session", "Jump with a class trainer open.", function(ctx)
 		return ctx.atTrainer
-	end)
+	end, JUMP)
 	add("gm_island", "oddity", "Wrong Neighborhood", "Jump on GM Island (if you somehow get there).", function(ctx)
 		return ctx.gmIsland
-	end)
+	end, JUMP)
 	add("idle_30", "oddity", "Archindula Noticed", "Jump after 30+ minutes without jumping.", function(ctx)
 		return (ctx.idleGap or 0) >= 1800
-	end)
+	end, JUMP)
 end
 
 local FEAT_CATEGORIES = {
@@ -1345,6 +1354,26 @@ local PRIDE_LINES = {
 	"Archindula would high-five you, but he's busy.",
 	"Archindula recommends stretching. Then more jumps.",
 	"Archindula told the guild. They're jealous.",
+	"Archindula muttered: 'adequate airtime.'",
+	"Archindula circled 'good form' on his clipboard.",
+	"Archindula says the ground missed you briefly.",
+	"Archindula awards you one polite golf clap.",
+	"Archindula notes: hopping remains on brand.",
+	"Archindula has added a gold star. Tiny one.",
+	"Archindula checked the hop. It's... hop-shaped.",
+	"Archindula says that one counted. Barely.",
+	"Archindula filed a brief report titled 'Up.'",
+	"Archindula raises an eyebrow. In approval.",
+	"Archindula whispered 'nice' into the void.",
+	"Archindula ranks this bounce: guild-acceptable.",
+	"Archindula says knees were optional. You used them.",
+	"Archindula stamped your ledger: JUMPED.",
+	"Archindula almost wrote a poem. He didn't.",
+	"Archindula says gravity blinked. You exploited it.",
+	"Archindula records another vertical victory.",
+	"Archindula nodded twice. That's a lot for him.",
+	"Archindula says the floor owed you that distance.",
+	"Archindula put it in the 'not embarrassing' pile.",
 }
 
 
@@ -1588,20 +1617,30 @@ end
 
 function ns.CheckAchievementsOnJump(extra)
 	ns.EnsureDB()
+	extra = extra or {}
+	local fromJump = not not extra.fromJump
+	extra.fromJump = fromJump
 	local ctx = ns.GetJumpContext(extra)
 	local earned = false
 	for _, ach in ipairs(ACHIEVEMENTS) do
-		if not ns.DB().achievements[ach.id] and ach.test(ctx) then
-			if ns.UnlockAchievement(ach) then
-				earned = true
+		if not ns.DB().achievements[ach.id] then
+			-- Location / situational feats only on an accepted jump (never login/zone).
+			if (ach.isLocation or ach.requiresJump) and not fromJump then
+				-- skip
+			elseif ach.test(ctx) then
+				if ns.UnlockAchievement(ach) then
+					earned = true
+				end
 			end
 		end
 	end
 	return earned
 end
 
+-- Progress-only feats (milestones, announce counts, collections). Safe on login.
 function ns.CheckAchievementsGeneral()
 	return ns.CheckAchievementsOnJump({
+		fromJump = false,
 		dayStreak = ns.CountJumpDays() > 0 and ns.NoteJumpDay() or 0,
 	})
 end
@@ -2158,7 +2197,7 @@ function ns.AnnounceStatus(channel)
 		channel
 	)
 	ns.DB().announceCount = (ns.ToNumberOr(ns.DB().announceCount, 0) or 0) + 1
-	if ns.CheckAchievementsOnJump({ dayStreak = ns.NoteJumpDay() }) and panel and panel:IsShown() and activeTab == "achieves" then
+	if ns.CheckAchievementsGeneral() and panel and panel:IsShown() and activeTab == "achieves" then
 		ns.UpdateAchievements()
 	end
 	return true
@@ -4455,7 +4494,7 @@ function ns.OnJump()
 	elseif db.jumps % 25 == 0 then
 		ns.BroadcastScore()
 	end
-	if ns.CheckAchievementsOnJump({ idleGap = idleGap, dayStreak = dayStreak }) and panel and panel:IsShown() and activeTab == "achieves" then
+	if ns.CheckAchievementsOnJump({ idleGap = idleGap, dayStreak = dayStreak, fromJump = true }) and panel and panel:IsShown() and activeTab == "achieves" then
 		ns.UpdateAchievements()
 	end
 	if panel and panel:IsShown() then
@@ -4538,7 +4577,7 @@ loader:SetScript("OnEvent", function(self, event, ...)
 		if panel then
 			panel:Update()
 		end
-		ns.		RestoreJumpXPBarFromSaved()
+		ns.RestoreJumpXPBarFromSaved()
 		if C_Timer and C_Timer.After then
 			C_Timer.After(0.5, ns.RestoreJumpXPBarFromSaved)
 			C_Timer.After(0.5, ns.TryLateSavedAdopt)
@@ -4546,7 +4585,8 @@ loader:SetScript("OnEvent", function(self, event, ...)
 			C_Timer.After(5, ns.TryLateSavedAdopt)
 			C_Timer.After(1, function()
 				if ns.EnsureDB() then
-					ns.CheckAchievementsOnJump({ dayStreak = ns.NoteJumpDay() })
+					-- Progress feats only — never location/situational (those need a real jump).
+					ns.CheckAchievementsGeneral()
 				end
 			end)
 		end

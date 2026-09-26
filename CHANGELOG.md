@@ -1,5 +1,10 @@
 ﻿# Changelog
 
+## 1.3.3
+
+- Twenty more Archindula pride lines for feat toasts / Habit flavor
+- Fix: location and situational feats (e.g. Jump in Brill) only unlock on an accepted jump — login / zone /reload no longer grants them
+
 ## 1.3.1
 
 - Fix CurseForge package: ship `Bindings.xml` again (Forever auto-loads it by filename; omitting it caused `Couldn't open .../Bindings.xml`). Still not listed in the TOC.
