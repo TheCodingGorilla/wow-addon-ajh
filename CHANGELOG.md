@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.0
+
+**Forever UI polish, Jump Feats tracker, and Settings**
+
+- Panel chrome matches CharacterFrame / SpellBook across Habit, Stats, Feats, Guild, and Levels
+- Feats: category boxing, gold frog branding, detail tidy (zebra rows, Back footer, on-bar progress count)
+- Shift-click a feat to track it under Objective Tracker (Jump Feats block); auto-untracks on unlock
+- HUD Jump XP bar: hover shows frog + `current/needed - %` text (dialog bar text stays always-on)
+- Settings: show/hide minimap button, show/hide feat unlock toasts (sound stays separate)
+- Settings cog restored beside the close button; General / Audio layout tidied
+
 ## 1.3.5
 
 - Code tidy: split into AJH_Data / AJH / AJH_UI modules; compact location + feat tables

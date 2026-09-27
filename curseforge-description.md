@@ -20,12 +20,12 @@ Made for **World of Warcraft: Forever**.
 - **Stats** — session/lifetime rates, best session, jumping vs idle %; **Levels** button for the 1-99 XP table
 - **Feats** — City / Town / Hostile / dungeon / raid hubs, plus habit milestones, style, travel, social, collections, oddities
 - **Guild** — shared leaderboard (jumps + feat count)
-- **Settings** — sounds on/off + volume, auto announce feats to guild
+- **Settings** — auto announce feats, Jump XP bar, minimap button, feat unlock toasts, sounds on/off + volume
 
 ### Feats
 Earn feats for jumping in places like **Brill**, **The Sepulcher**, **Undercity**, other towns and cities, enemy territory, dungeons, and raids. Opposite-faction hubs show under **Hostile Territory**.
 
-Completing a feat plays a toast with fanfare and a line from Archindula. Level-ups use the same toast style.
+Shift-click a feat to pin it on the Objective Tracker (Jump Feats). Completing a feat plays a toast with fanfare and a line from Archindula. Level-ups use the same toast style.
 
 ### Guild
 - Leaderboard synced via guild addon messages
@@ -33,9 +33,12 @@ Completing a feat plays a toast with fanfare and a line from Archindula. Level-u
 - Feat unlocks can also shout in guild chat
 
 ### Quality of life
-- Minimap button (drag to move)
+- CharacterFrame-style panel chrome
+- Movable on-screen Jump XP bar (Edit Mode)
+- Minimap button (drag to move; can hide in Settings)
 - Account SavedVariables progress
 - Esc to close the panel
+- Keybind to open/close the panel
 
 ## Commands
 
