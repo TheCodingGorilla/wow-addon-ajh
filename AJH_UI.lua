@@ -2,6 +2,8 @@ local ADDON_NAME, ns = ...
 local S = ns.S
 local C = ns.C
 local ui = S.ui
+ui.achRows = ui.achRows or {}
+ui.featCatRows = ui.featCatRows or {}
 local ROW_HEIGHT = ns.ROW_HEIGHT
 local FROG_ICON = ns.FROG_ICON
 local FEATS_ICON = ns.FEATS_ICON
@@ -13,6 +15,7 @@ local DEV_TOOLS = ns.DEV_TOOLS
 local ADDON_PREFIX = ns.ADDON_PREFIX
 local JUMP_XP_BAR_HEIGHT = ns.JUMP_XP_BAR_HEIGHT
 local HABIT_PANEL_XP_BAR_HEIGHT = ns.HABIT_PANEL_XP_BAR_HEIGHT
+local JUMP_ACTIVITY_SEC = ns.JUMP_ACTIVITY_SEC or 0.8
 
 -- Locals used only inside UI builders (not shared).
 local announceDialog
@@ -1361,6 +1364,9 @@ local FEAT_CAT_ICONS = {
 }
 
 function ns.HideFeatRows(rows)
+	if type(rows) ~= "table" then
+		return
+	end
 	for _, row in pairs(rows) do
 		row:Hide()
 	end
@@ -1676,7 +1682,7 @@ function ns.UpdateAchievements()
 
 		child:SetSize(300, math.max(#feats, 1) * ACH_ROW_HEIGHT)
 		if ui.achSummary then
-			ui.achSummary:SetText(string.format("%s  ?  %d / %d", catName, earned, total))
+			ui.achSummary:SetText(string.format("%s - %d / %d", catName, earned, total))
 		end
 	else
 		ns.HideFeatRows(ui.achRows)
@@ -2464,31 +2470,31 @@ function ns.BuildPanel()
 		if S.activeTab == "stats" and ui.statsView == "main" and ui.statSessionJumps then
 			local now = GetTime()
 			local elapsed = math.max(1, ns.CurrentSessionElapsed())
-			local perMin = sessionJumps * 60 / elapsed
-			local perHr = sessionJumps * 3600 / elapsed
+			local perMin = S.sessionJumps * 60 / elapsed
+			local perHr = S.sessionJumps * 3600 / elapsed
 			local recent = ns.CountJumpsInWindow(300)
 			local recentPerMin = recent / 5
 			local best = ns.DB().sessionJumpHigh or 0
-			if sessionJumps > best then
-				best = sessionJumps
+			if S.sessionJumps > best then
+				best = S.sessionJumps
 			end
 			local featEarned = ns.CountOwnAchievements()
 			local featTotal = #ACHIEVEMENTS
 			local lifePlay = ns.LifetimePlayTime()
-			local sessionJumpSec = sessionJumps * JUMP_ACTIVITY_SEC
+			local sessionJumpSec = S.sessionJumps * JUMP_ACTIVITY_SEC
 			local lifeJumpSec = ns.LifetimeJumpActivityTime()
 
 			if best > 0 then
-				local pctOfBest = math.floor((sessionJumps / best) * 100 + 0.5)
-				ui.statSessionJumps:SetText(string.format("%s (%d%%)", ns.FormatNumber(sessionJumps), pctOfBest))
+				local pctOfBest = math.floor((S.sessionJumps / best) * 100 + 0.5)
+				ui.statSessionJumps:SetText(string.format("%s (%d%%)", ns.FormatNumber(S.sessionJumps), pctOfBest))
 				ui.statSessionHigh:SetText(ns.FormatNumber(best))
 			else
-				ui.statSessionJumps:SetText(ns.FormatNumber(sessionJumps))
+				ui.statSessionJumps:SetText(ns.FormatNumber(S.sessionJumps))
 				ui.statSessionHigh:SetText("?")
 			end
 			ui.statSessionTime:SetText(ns.FormatDuration(elapsed))
 			ui.statSessionActivity:SetText(ns.FormatJumpIdlePct(sessionJumpSec, elapsed))
-			ui.statSessionRate:SetText(string.format("%.1f/min  ?  %.0f/hr", perMin, perHr))
+			ui.statSessionRate:SetText(string.format("%.1f/min - %.0f/hr", perMin, perHr))
 			ui.statRecentRate:SetText(string.format("%.1f/min", recentPerMin))
 			ui.statLifeJumps:SetText(ns.FormatNumber(jumps))
 			ui.statLifeLevel:SetText(tostring(level))
@@ -2499,8 +2505,8 @@ function ns.BuildPanel()
 			else
 				ui.statFeats:SetText(string.format("%d / %d", featEarned, featTotal))
 			end
-			if lastAcceptedJumpTime > 0 then
-				ui.statLastJump:SetText(ns.FormatDuration(now - lastAcceptedJumpTime))
+			if S.lastAcceptedJumpTime > 0 then
+				ui.statLastJump:SetText(ns.FormatDuration(now - S.lastAcceptedJumpTime))
 			else
 				ui.statLastJump:SetText("?")
 			end
@@ -2551,9 +2557,15 @@ function ns.UpdateMinimapButtonPosition()
 	if not minimapButton then
 		return
 	end
-	-- Do NOT call EnsureDB here ? position reads AJHSaved if present.
-	local angle = math.rad((type(AJHSaved) == "table" and ns.DB().minimapPos) or 210)
+	-- Prefer live DB (saved or ephemeral session). Do not invent AJHSaved here.
+	local db = ns.DB()
+	local pos = 210
+	if db and type(db.minimapPos) == "number" then
+		pos = db.minimapPos
+	end
+	local angle = math.rad(pos)
 	local radius = (Minimap:GetWidth() / 2) + 5
+	minimapButton:ClearAllPoints()
 	minimapButton:SetPoint("CENTER", Minimap, "CENTER", math.cos(angle) * radius, math.sin(angle) * radius)
 end
 
@@ -2605,10 +2617,18 @@ function ns.BuildMinimapButton()
 		ns.TogglePanel()
 	end)
 
+	local function applyMinimapAngle(frame, angleDeg)
+		local radius = (Minimap:GetWidth() / 2) + 5
+		local rad = math.rad(angleDeg)
+		frame:ClearAllPoints()
+		frame:SetPoint("CENTER", Minimap, "CENTER", math.cos(rad) * radius, math.sin(rad) * radius)
+	end
+
 	btn:SetScript("OnDragStart", function(self)
 		minimapDragging = true
 		GameTooltip:Hide()
-		self._ajhDragAngle = (type(AJHSaved) == "table" and ns.DB() and ns.DB().minimapPos) or 210
+		local db = ns.DB()
+		self._ajhDragAngle = (db and type(db.minimapPos) == "number" and db.minimapPos) or 210
 		self:SetScript("OnUpdate", function(btnFrame)
 			local mx, my = Minimap:GetCenter()
 			local cx, cy = GetCursorPosition()
@@ -2616,9 +2636,7 @@ function ns.BuildMinimapButton()
 			cx, cy = cx / scale, cy / scale
 			local angle = math.deg(math.atan2(cy - my, cx - mx))
 			btnFrame._ajhDragAngle = angle
-			local radius = (Minimap:GetWidth() / 2) + 5
-			local rad = math.rad(angle)
-			btnFrame:SetPoint("CENTER", Minimap, "CENTER", math.cos(rad) * radius, math.sin(rad) * radius)
+			applyMinimapAngle(btnFrame, angle)
 		end)
 	end)
 
@@ -2631,8 +2649,11 @@ function ns.BuildMinimapButton()
 			if db then
 				db.minimapPos = angle
 			end
+			-- Apply the drag angle directly so a stale/default read cannot snap it back.
+			applyMinimapAngle(self, angle)
+		else
+			ns.UpdateMinimapButtonPosition()
 		end
-		ns.UpdateMinimapButtonPosition()
 		C_Timer.After(0, function()
 			minimapDragging = false
 		end)

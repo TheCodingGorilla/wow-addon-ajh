@@ -27,10 +27,12 @@ ns.FROG_ICON = FROG_ICON
 local FEATS_ICON = "Interface\\Icons\\Achievement_General"
 ns.FEATS_ICON = FEATS_ICON
 
--- Session jump counter (declared early so feat tests can close over it).
-local sessionJumps = 0
-local lastAcceptedJumpTime = 0
-local sessionStartTime = 0
+-- Session + UI state shared across AJH_*.lua
+ns.S = ns.S or {}
+local S = ns.S
+S.sessionJumps = S.sessionJumps or 0
+S.lastAcceptedJumpTime = S.lastAcceptedJumpTime or 0
+S.sessionStartTime = S.sessionStartTime or 0
 
 -- Local testing only. Enabled when Interface/AddOns/AJH/AJH_Dev exists
 -- (gitignored; never shipped in the CurseForge zip). Not listed in the TOC.
@@ -929,8 +931,8 @@ do
 	add("streak_3", "milestone", "Three-Day Tick", "Jump on 3 consecutive calendar days.", function(ctx) return (ctx.dayStreak or 0) >= 3 end, JUMP)
 	add("streak_7", "milestone", "Weekly Legs", "Jump on 7 consecutive calendar days.", function(ctx) return (ctx.dayStreak or 0) >= 7 end, JUMP)
 	add("streak_30", "milestone", "Monthly Devotion", "Jump on 30 consecutive calendar days.", function(ctx) return (ctx.dayStreak or 0) >= 30 end, JUMP)
-	add("session_50", "milestone", "Warm-Up Crush", "Make 50 jumps in a single session.", function() return sessionJumps >= 50 end)
-	add("session_200", "milestone", "Session Savage", "Make 200 jumps in a single session.", function() return sessionJumps >= 200 end)
+	add("session_50", "milestone", "Warm-Up Crush", "Make 50 jumps in a single session.", function() return S.sessionJumps >= 50 end)
+	add("session_200", "milestone", "Session Savage", "Make 200 jumps in a single session.", function() return S.sessionJumps >= 200 end)
 
 	for _, row in ipairs({
 		{ "camp_jump", "style", "Camp Cadet", "Jump while Camp Benefit is active.", "camp" },
@@ -1026,9 +1028,7 @@ function ns.CountCategoryProgress(categoryId)
 	end
 	return earned, total
 end
--- Shared UI/toast state (AJH_UI.lua uses the same ns.S table).
-ns.S = ns.S or {}
-local S = ns.S
+-- Shared UI/toast state (same ns.S table as above).
 S.activeTab = S.activeTab or "habit"
 S.toastQueue = S.toastQueue or {}
 S.toastBusy = not not S.toastBusy
@@ -1338,13 +1338,14 @@ function ns.ResetAchievements()
 	end
 end
 
-S.ui = S.ui or {
-	tabs = {},
-	pages = {},
-	levelRows = {},
-	boardRows = {},
-}
+S.ui = S.ui or {}
 local ui = S.ui
+ui.tabs = ui.tabs or {}
+ui.pages = ui.pages or {}
+ui.levelRows = ui.levelRows or {}
+ui.boardRows = ui.boardRows or {}
+ui.achRows = ui.achRows or {}
+ui.featCatRows = ui.featCatRows or {}
 local lastGuildReply = 0
 -- Shared guild-sync notes (AJH_UI.lua writes send/sync; core writes recv).
 S.guildSendNote = S.guildSendNote or "none"
@@ -1355,7 +1356,7 @@ ns.JUMP_XP_BAR_HEIGHT = 14
 ns.HABIT_PANEL_XP_BAR_HEIGHT = 22
 
 -- Session statistics (not SavedVariables), except playTime / sessionJumpHigh in AJHSaved.
--- sessionJumps / lastAcceptedJumpTime / sessionStartTime declared near top of file.
+-- Session counters live on ns.S (shared with AJH_UI.lua).
 local JUMP_TIME_RING_SIZE = 200
 local jumpTimeRing = {}
 local jumpTimeRingCount = 0
@@ -1365,16 +1366,17 @@ local playTimeFlushed = 0
 local playTimeTicker
 -- Attributed active time per accepted jump (matches jump cooldown cadence).
 local JUMP_ACTIVITY_SEC = 0.8
+ns.JUMP_ACTIVITY_SEC = JUMP_ACTIVITY_SEC
 
 function ns.EnsureSessionClock()
-	if sessionStartTime <= 0 then
-		sessionStartTime = GetTime()
+	if S.sessionStartTime <= 0 then
+		S.sessionStartTime = GetTime()
 	end
 end
 
 function ns.CurrentSessionElapsed()
 	ns.EnsureSessionClock()
-	return math.max(0, GetTime() - sessionStartTime)
+	return math.max(0, GetTime() - S.sessionStartTime)
 end
 
 function ns.FlushPlayTime()
@@ -1422,13 +1424,13 @@ function ns.FormatJumpIdlePct(jumpSec, totalSec)
 	end
 	local jumpPct = math.min(100, (jumpSec / totalSec) * 100)
 	local idlePct = math.max(0, 100 - jumpPct)
-	return string.format("%.0f%% jumping ? %.0f%% idle", jumpPct, idlePct)
+	return string.format("%.0f%% jumping - %.0f%% idle", jumpPct, idlePct)
 end
 
 function ns.RecordSessionJump(now)
 	ns.EnsureSessionClock()
-	sessionJumps = sessionJumps + 1
-	lastAcceptedJumpTime = now
+	S.sessionJumps = S.sessionJumps + 1
+	S.lastAcceptedJumpTime = now
 	jumpTimeRing[jumpTimeRingNext] = now
 	jumpTimeRingNext = (jumpTimeRingNext % JUMP_TIME_RING_SIZE) + 1
 	if jumpTimeRingCount < JUMP_TIME_RING_SIZE then
@@ -1439,8 +1441,8 @@ end
 function ns.NoteSessionJumpHigh()
 	ns.EnsureDB()
 	local high = ns.DB().sessionJumpHigh or 0
-	if sessionJumps > high then
-		ns.DB().sessionJumpHigh = sessionJumps
+	if S.sessionJumps > high then
+		ns.DB().sessionJumpHigh = S.sessionJumps
 	end
 end
 
@@ -1544,7 +1546,7 @@ function ns.OnJump()
 		return
 	end
 	lastJumpTime = now
-	local idleGap = (lastAcceptedJumpTime > 0) and (now - lastAcceptedJumpTime) or 0
+	local idleGap = (S.lastAcceptedJumpTime > 0) and (now - S.lastAcceptedJumpTime) or 0
 	ns.RecordSessionJump(now)
 
 	local db = ns.EnsureDB()
