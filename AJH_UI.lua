@@ -16,6 +16,8 @@ local ADDON_PREFIX = ns.ADDON_PREFIX
 local JUMP_XP_BAR_HEIGHT = ns.JUMP_XP_BAR_HEIGHT
 local HABIT_PANEL_XP_BAR_HEIGHT = ns.HABIT_PANEL_XP_BAR_HEIGHT
 local JUMP_ACTIVITY_SEC = ns.JUMP_ACTIVITY_SEC or 0.8
+local XP_PER_JUMP = ns.XP_PER_JUMP or 1
+local CAMP_XP_MULTIPLIER = ns.CAMP_XP_MULTIPLIER or 2
 
 -- Locals used only inside UI builders (not shared).
 local announceDialog
@@ -475,7 +477,10 @@ function ns.UpdateJumpXPBar()
 		jumpXPBar.bar:SetMinMaxValues(0, 1)
 		jumpXPBar.bar:SetValue(1)
 		if jumpXPBar.text then
-			jumpXPBar.text:SetText(string.format("Level %d  MAX", level))
+			jumpXPBar.text:SetText(string.format(
+				"%s / MAX - 100%%",
+				ns.FormatNumber(intoLevel)
+			))
 		end
 	else
 		intoLevel = xp - xpForLevel[level]
@@ -485,7 +490,12 @@ function ns.UpdateJumpXPBar()
 		jumpXPBar.bar:SetMinMaxValues(0, needed)
 		jumpXPBar.bar:SetValue(intoLevel)
 		if jumpXPBar.text then
-			jumpXPBar.text:SetText(string.format("Level %d  %d%%", level, pct))
+			jumpXPBar.text:SetText(string.format(
+				"%s / %s - %d%%",
+				ns.FormatNumber(intoLevel),
+				ns.FormatNumber(needed),
+				pct
+			))
 		end
 	end
 
@@ -747,8 +757,30 @@ function ns.BuildJumpXPBar()
 		text:SetFontObject(TextStatusBarText)
 	end
 	text:SetPoint("CENTER", holder, "CENTER", 0, 0)
+	text:Hide()
+
+	-- Gold frog on the left of the on-screen XP bar.
+	local frogSize = math.max((JUMP_XP_BAR_HEIGHT or 11) + 6, 18)
+	local frog = holder:CreateTexture(nil, "OVERLAY", nil, 7)
+	frog:SetSize(frogSize, frogSize)
+	frog:SetPoint("LEFT", holder, "LEFT", 1, 0)
+	frog:SetTexture("Interface\\AddOns\\AJH\\AJH-gold-frog")
+	if frog.SetTexCoord then
+		frog:SetTexCoord(0.06, 0.94, 0.06, 0.94)
+	end
+	if frog.SetBlendMode then
+		frog:SetBlendMode("BLEND")
+	end
+	holder.frog = frog
+	frog:Hide()
 
 	holder:SetScript("OnEnter", function(self)
+		if self.text then
+			self.text:Show()
+		end
+		if self.frog then
+			self.frog:Show()
+		end
 		if ns.IsEditModeActive() then
 			return
 		end
@@ -783,8 +815,14 @@ function ns.BuildJumpXPBar()
 		GameTooltip:AddLine("Edit Mode: move, width, and reset", 0.55, 0.55, 0.55)
 		GameTooltip:Show()
 	end)
-	holder:SetScript("OnLeave", function()
+	holder:SetScript("OnLeave", function(self)
 		GameTooltip:Hide()
+		if self.text then
+			self.text:Hide()
+		end
+		if self.frog then
+			self.frog:Hide()
+		end
 	end)
 	holder:SetScript("OnSizeChanged", function(self)
 		if self.LayoutChrome then
@@ -1051,19 +1089,670 @@ function ns.CreateStatRow(parent, anchor, y)
 	return label, value
 end
 
-function ns.CreateScrollArea(parent)
-	local wrap = CreateFrame("Frame", nil, parent, "InsetFrameTemplate")
+-- Prefer Forever/Blizzard character-sheet category header art when available.
+-- Do NOT Show/Expand CharacterFrame or call PaperDollFrame_UpdateStats from here —
+-- that taints Camelot secret-value paths in UpdateStats.
+local function EnsureCharacterCategoryArtLoaded()
+	pcall(function()
+		if C_AddOns and C_AddOns.LoadAddOn then
+			C_AddOns.LoadAddOn("Blizzard_CharacterUI")
+			C_AddOns.LoadAddOn("Blizzard_UIPanels_Game")
+			C_AddOns.LoadAddOn("Blizzard_CharacterFrame")
+		elseif LoadAddOn then
+			LoadAddOn("Blizzard_CharacterUI")
+			LoadAddOn("Blizzard_CharacterFrame")
+		end
+	end)
+end
+
+local CATEGORY_TEMPLATES = {
+	"CharacterStatFrameCategoryTemplate",
+	"StatCategoryTemplate",
+	"CharacterFrameCategoryTemplate",
+}
+
+local CATEGORY_ATLAS_SETS = {
+	{ "UI-Character-Info-Categories-Left", "_UI-Character-Info-Categories-Tile", "UI-Character-Info-Categories-Right" },
+	{ "characterinfo-categories-left", "_characterinfo-categories-tile", "characterinfo-categories-right" },
+	{ "UI-Frame-DiamondMetal-Header-CornerLeft", "_UI-Frame-DiamondMetal-Header-Tile", "UI-Frame-DiamondMetal-Header-CornerRight" },
+}
+
+local function FindLiveStatCategoryFrame()
+	for i = 1, 10 do
+		local f = _G["CharacterStatsPaneCategory" .. i]
+			or _G["CharacterStatsPaneCategoryFrame" .. i]
+			or _G["PaperDollFrameStatCategory" .. i]
+			or _G["StatCategoryFrame" .. i]
+		if f then
+			return f
+		end
+	end
+	local function walk(frame, depth)
+		if not frame or depth > 7 then
+			return nil
+		end
+		if frame.Category or frame.Toolbar or frame.TitleBg then
+			return frame
+		end
+		local nameText = frame.NameText or frame.TitleText
+		if nameText and nameText.GetText then
+			local t = nameText:GetText()
+			if t == "General" or t == "Primary Attributes" or t == GENERAL then
+				return frame
+			end
+		end
+		if frame.GetChildren then
+			local kids = { frame:GetChildren() }
+			for i = 1, #kids do
+				local found = walk(kids[i], depth + 1)
+				if found then
+					return found
+				end
+			end
+		end
+		return nil
+	end
+	return walk(_G.CharacterStatsPane, 0)
+		or walk(_G.PaperDollFrame, 0)
+		or walk(_G.CharacterFrame, 0)
+end
+
+local function GetCategoryTitleHeight(src)
+	local base = 28
+	if src then
+		local candidates = {
+			src.Toolbar,
+			src.TitleBg,
+			src.Background,
+			src.Left,
+			src.Toolbar and src.Toolbar.Left,
+			src.Toolbar and src.Toolbar.Middle,
+		}
+		for i = 1, #candidates do
+			local c = candidates[i]
+			if c and c.GetHeight then
+				local h = c:GetHeight()
+				if h and h >= 18 and h <= 40 then
+					base = math.floor(h + 0.5)
+					break
+				end
+			end
+		end
+	end
+	return base + 15
+end
+
+local function GetCategoryArtSource(src)
+	if not src then
+		return nil
+	end
+	-- Title chrome often lives on a Toolbar / header child, not the full category.
+	if src.Toolbar and (src.Toolbar.Left or src.Toolbar.Middle) then
+		return src.Toolbar
+	end
+	if src.Header and (src.Header.Left or src.Header.Middle) then
+		return src.Header
+	end
+	return src
+end
+
+local function CloneTextureOnto(dest, src)
+	if not dest or not src then
+		return false
+	end
+	local atlas = src.GetAtlas and src:GetAtlas()
+	if atlas and atlas ~= "" then
+		return ns.TrySetAtlas(dest, atlas, false)
+	end
+	local path = src.GetTexture and src:GetTexture()
+	if path then
+		dest:SetTexture(path)
+		if src.GetTexCoord then
+			local l, r, t, b = src:GetTexCoord()
+			if l then
+				dest:SetTexCoord(l, r, t, b)
+			end
+		end
+		if src.GetVertexColor then
+			local cr, cg, cb, ca = src:GetVertexColor()
+			if cr then
+				dest:SetVertexColor(cr, cg, cb, ca or 1)
+			end
+		end
+		return true
+	end
+	return false
+end
+
+local function ApplyLiveCategoryArt(left, mid, right, src)
+	src = GetCategoryArtSource(src)
+	if not src then
+		return false
+	end
+	local L = src.Left or src.LeftEdge or src.BgLeft
+	local M = src.Middle or src.Center or src.BgMiddle
+	local R = src.Right or src.RightEdge or src.BgRight
+	if L and M and R then
+		return CloneTextureOnto(left, L) and CloneTextureOnto(mid, M) and CloneTextureOnto(right, R)
+	end
+	-- Fallback: first three shown textures on the source.
+	local regions = { src:GetRegions() }
+	local textures = {}
+	for i = 1, #regions do
+		local r = regions[i]
+		if r and r.GetObjectType and r:GetObjectType() == "Texture" and r:IsShown() then
+			textures[#textures + 1] = r
+		end
+	end
+	if #textures >= 3 then
+		return CloneTextureOnto(left, textures[1])
+			and CloneTextureOnto(mid, textures[2])
+			and CloneTextureOnto(right, textures[3])
+	end
+	return false
+end
+
+local function ApplyLabelFrameArt(left, mid, right)
+	local path = "Interface\\Glues\\CharacterCreate\\CharacterCreate-LabelFrame"
+	left:SetTexture(path)
+	left:SetTexCoord(0, 0.1953125, 0, 1)
+	mid:SetTexture(path)
+	mid:SetTexCoord(0.1953125, 0.8046875, 0, 1)
+	right:SetTexture(path)
+	right:SetTexCoord(0.8046875, 1, 0, 1)
+	return true
+end
+
+local function StyleHeaderLabel(fs, text, live)
+	if not fs or not fs.SetText then
+		return
+	end
+	fs:SetText(text or "")
+	local srcText = live and (live.NameText or live.TitleText or live.Text or live.Label)
+	if srcText and srcText.GetTextColor then
+		local r, g, b, a = srcText:GetTextColor()
+		if r then
+			fs:SetTextColor(r, g, b, a or 1)
+			return
+		end
+	end
+	-- Character sheet titles are near-white.
+	fs:SetTextColor(0.98, 0.96, 0.90)
+end
+
+-- Same assets as Forever character-sheet category headings (General, etc.).
+-- Never paint fake gold rails — those never look right next to the real art.
+function ns.CreateSectionHeader(parent, text)
+	EnsureCharacterCategoryArtLoaded()
+	local live = FindLiveStatCategoryFrame()
+	local HEADER_H = GetCategoryTitleHeight(live)
+
+	-- 1) Exact Blizzard/Forever category template when available.
+	for i = 1, #CATEGORY_TEMPLATES do
+		local ok, btn = pcall(CreateFrame, "Button", nil, parent, CATEGORY_TEMPLATES[i])
+		if ok and btn then
+			btn:EnableMouse(false)
+			btn:SetHeight(HEADER_H)
+			if btn.Toolbar and btn.Toolbar.Hide then
+				-- Keep toolbar textures visible; only kill the collapse control.
+				local collapse = btn.Toolbar.CollapseButton or btn.Toolbar.Button or btn.CollapseButton
+				if collapse and collapse.Hide then
+					collapse:Hide()
+					collapse:EnableMouse(false)
+				end
+			elseif btn.CollapseButton then
+				btn.CollapseButton:Hide()
+				btn.CollapseButton:EnableMouse(false)
+			end
+			if btn.SetText then
+				btn:SetText(text or "")
+			end
+			local fs = btn.Text or btn.Label or btn.Title or btn.NameText
+				or (btn.GetFontString and btn:GetFontString())
+			StyleHeaderLabel(fs, text, live)
+			btn.label = fs
+			return btn
+		end
+	end
+
+	-- 2) Build left/mid/right from live category art or known atlases.
+	local h = CreateFrame("Frame", nil, parent)
+	h:SetHeight(HEADER_H)
+
+	local left = h:CreateTexture(nil, "BACKGROUND")
+	left:SetSize(math.floor(HEADER_H * 0.7), HEADER_H)
+	left:SetPoint("LEFT", 0, 0)
+	local right = h:CreateTexture(nil, "BACKGROUND")
+	right:SetSize(math.floor(HEADER_H * 0.7), HEADER_H)
+	right:SetPoint("RIGHT", 0, 0)
+	local mid = h:CreateTexture(nil, "BACKGROUND")
+	mid:SetPoint("TOPLEFT", left, "TOPRIGHT", 0, 0)
+	mid:SetPoint("BOTTOMRIGHT", right, "BOTTOMLEFT", 0, 0)
+
+	local artOk = ApplyLiveCategoryArt(left, mid, right, live)
+	if not artOk then
+		for _, set in ipairs(CATEGORY_ATLAS_SETS) do
+			if ns.TrySetAtlas(left, set[1], false)
+				and ns.TrySetAtlas(mid, set[2], false)
+				and ns.TrySetAtlas(right, set[3], false)
+			then
+				if mid.SetHorizTile then
+					mid:SetHorizTile(true)
+				end
+				artOk = true
+				break
+			end
+		end
+	end
+	if not artOk then
+		artOk = ApplyLabelFrameArt(left, mid, right)
+	end
+	if not artOk then
+		left:SetColorTexture(0.16, 0.12, 0.08, 0.98)
+		mid:SetColorTexture(0.16, 0.12, 0.08, 0.98)
+		right:SetColorTexture(0.16, 0.12, 0.08, 0.98)
+	end
+
+	local label = h:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	label:SetPoint("CENTER", 0, 0)
+	StyleHeaderLabel(label, text, live)
+	if label.SetShadowOffset then
+		label:SetShadowOffset(1, -1)
+		label:SetShadowColor(0, 0, 0, 0.9)
+	end
+	h.label = label
+	h._ajhLeft, h._ajhMid, h._ajhRight = left, mid, right
+
+	-- If CharacterFrame wasn't ready at build time, re-bind real art on first show.
+	if not live then
+		h:SetScript("OnShow", function(self)
+			if self._ajhArtBound then
+				return
+			end
+			EnsureCharacterCategoryArtLoaded()
+			local src = FindLiveStatCategoryFrame()
+			if src and ApplyLiveCategoryArt(self._ajhLeft, self._ajhMid, self._ajhRight, src) then
+				self:SetHeight(GetCategoryTitleHeight(src))
+				StyleHeaderLabel(self.label, text, src)
+				self._ajhArtBound = true
+			end
+		end)
+	end
+	return h
+end
+
+-- Stat row with character-sheet zebra striping (odd dark / even mid-brown).
+function ns.CreateModernStatRow(parent, relativeTo, yOff, labelText, stripeIndex)
+	local row = CreateFrame("Frame", nil, parent)
+	row:SetHeight(22)
+	if relativeTo then
+		row:SetPoint("TOPLEFT", relativeTo, "BOTTOMLEFT", 0, yOff or -1)
+		row:SetPoint("TOPRIGHT", relativeTo, "BOTTOMRIGHT", 0, yOff or -1)
+	end
+	row.bg = row:CreateTexture(nil, "BACKGROUND")
+	row.bg:SetAllPoints()
+	local odd = ((stripeIndex or 1) % 2) == 1
+	if odd then
+		row.bg:SetColorTexture(0.06, 0.05, 0.04, 0.92)
+	else
+		row.bg:SetColorTexture(0.17, 0.13, 0.09, 0.88)
+	end
+
+	row.label = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	row.label:SetPoint("LEFT", 10, 0)
+	row.label:SetText(labelText or "")
+	row.label:SetTextColor(1, 0.82, 0)
+
+	row.value = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	row.value:SetPoint("RIGHT", -10, 0)
+	row.value:SetTextColor(0.95, 0.95, 0.92)
+	return row
+end
+
+local function HideNineSlice(nine)
+	if not nine then
+		return
+	end
+	for _, key in ipairs({
+		"TopLeftCorner", "TopRightCorner", "BottomLeftCorner", "BottomRightCorner",
+		"TopEdge", "BottomEdge", "LeftEdge", "RightEdge", "Center",
+	}) do
+		local piece = nine[key]
+		if piece and piece.Hide then
+			piece:Hide()
+		end
+	end
+end
+
+local function TintNineSlice(nine, r, g, b)
+	if not nine then
+		return
+	end
+	for _, key in ipairs({
+		"TopLeftCorner", "TopRightCorner", "BottomLeftCorner", "BottomRightCorner",
+		"TopEdge", "BottomEdge", "LeftEdge", "RightEdge",
+	}) do
+		local piece = nine[key]
+		if piece and piece.SetVertexColor then
+			piece:SetVertexColor(r, g, b)
+		end
+	end
+end
+
+-- Light chrome only: keep Blizzard ButtonFrame title/border colours untouched.
+-- Do NOT call ButtonFrameTemplate_HidePortrait (blanks CloseButton on Forever).
+function ns.ApplyModernPanelChrome(frame)
+	if not frame then
+		return
+	end
+
+	local function KillChromeStrips()
+		if ButtonFrameTemplate_HideAttic then
+			pcall(ButtonFrameTemplate_HideAttic, frame)
+		end
+		if ButtonFrameTemplate_HideButtonBar then
+			pcall(ButtonFrameTemplate_HideButtonBar, frame)
+		end
+		for _, key in ipairs({
+			"TopTileStreaks", "TitleBg", "TopBorder", "Attic", "BgTop", "Top",
+			"BottomTileStreaks", "BtnBarTop", "BtnBarBottom", "ButtonBar",
+			"BottomBorder", "BgBottom", "Bottom",
+		}) do
+			local piece = frame[key]
+			if piece and piece.Hide then
+				piece:Hide()
+			end
+		end
+	end
+	KillChromeStrips()
+	if not frame._ajhAtticHooked then
+		frame._ajhAtticHooked = true
+		frame:HookScript("OnShow", KillChromeStrips)
+	end
+
+	local flatR, flatG, flatB = 0.06, 0.055, 0.05
+
+	-- Flat dark plate over the title→inset gap.
+	local cover = frame._ajhAtticCover
+	if not cover then
+		cover = frame:CreateTexture(nil, "ARTWORK", nil, 7)
+		frame._ajhAtticCover = cover
+	end
+	cover:SetTexture("Interface\\Buttons\\WHITE8X8")
+	cover:SetVertexColor(flatR, flatG, flatB, 1)
+	cover:ClearAllPoints()
+	cover:SetPoint("TOPLEFT", frame, "TOPLEFT", 3, -20)
+	cover:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -3, -20)
+	if frame.Inset then
+		cover:SetPoint("BOTTOMLEFT", frame.Inset, "TOPLEFT", 0, 0)
+		cover:SetPoint("BOTTOMRIGHT", frame.Inset, "TOPRIGHT", 0, 0)
+	else
+		cover:SetHeight(48)
+	end
+	cover:Show()
+
+	-- Same treatment for the bottom button-bar grey strip.
+	local bottomCover = frame._ajhBottomCover
+	if not bottomCover then
+		bottomCover = frame:CreateTexture(nil, "ARTWORK", nil, 7)
+		frame._ajhBottomCover = bottomCover
+	end
+	bottomCover:SetTexture("Interface\\Buttons\\WHITE8X8")
+	bottomCover:SetVertexColor(flatR, flatG, flatB, 1)
+	bottomCover:ClearAllPoints()
+	bottomCover:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 3, 3)
+	bottomCover:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -3, 3)
+	if frame.Inset then
+		bottomCover:SetPoint("TOPLEFT", frame.Inset, "BOTTOMLEFT", 0, 0)
+		bottomCover:SetPoint("TOPRIGHT", frame.Inset, "BOTTOMRIGHT", 0, 0)
+	else
+		bottomCover:SetHeight(28)
+	end
+	bottomCover:Show()
+
+	if frame.Inset then
+		-- Drop the inner "window" border so content sits flush like CharacterFrame.
+		HideNineSlice(frame.Inset.NineSlice)
+		-- Replace the default stone rock inset fill with a flat colour.
+		if frame.Inset.Bg then
+			local bg = frame.Inset.Bg
+			bg:Show()
+			if bg.SetHorizTile then
+				bg:SetHorizTile(false)
+				bg:SetVertTile(false)
+			end
+			bg:SetTexture("Interface\\Buttons\\WHITE8X8")
+			bg:SetVertexColor(0.06, 0.055, 0.05, 1)
+		end
+	end
+	-- Raise CloseButton above NineSlice so the X isn't covered by the gold corner.
+	if frame.CloseButton then
+		local cb = frame.CloseButton
+		local nsLevel = frame.NineSlice and frame.NineSlice.GetFrameLevel and frame.NineSlice:GetFrameLevel()
+		local base = math.max(frame:GetFrameLevel(), nsLevel or 0)
+		cb:SetFrameLevel(base + 10)
+		cb:EnableMouse(true)
+		cb:Show()
+	end
+
+	-- Vertically centre the title in the header bar (stock layout sits a hair high).
+	-- Leave room on the right for the settings cog + close button.
+	local titleContainer = frame.TitleContainer
+	local title = (titleContainer and titleContainer.TitleText) or frame.TitleText
+	if titleContainer then
+		titleContainer:ClearAllPoints()
+		titleContainer:SetPoint("TOPLEFT", frame, "TOPLEFT", 60, 0)
+		titleContainer:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -54, 0)
+		titleContainer:SetHeight(22)
+	end
+	if title then
+		title:ClearAllPoints()
+		if titleContainer then
+			title:SetPoint("CENTER", titleContainer, "CENTER", 0, 0)
+		else
+			title:SetPoint("TOP", frame, "TOP", 0, -5)
+		end
+		title:SetJustifyV("MIDDLE")
+	end
+end
+
+-- Flat page fill so no stone rock shows through scroll children / content frames.
+function ns.ApplyContentFill(frame)
+	if not frame then
+		return
+	end
+	local fill = frame._ajhContentFillTex
+	if not fill then
+		fill = frame:CreateTexture(nil, "BACKGROUND", nil, -8)
+		fill:SetAllPoints()
+		frame._ajhContentFillTex = fill
+	end
+	fill:Show()
+	if fill.SetHorizTile then
+		fill:SetHorizTile(false)
+		fill:SetVertTile(false)
+	end
+	fill:SetTexture("Interface\\Buttons\\WHITE8X8")
+	fill:SetVertexColor(0.06, 0.055, 0.05, 1)
+	frame._ajhContentFill = true
+end
+
+-- Modern Forever scroll area: thin MinimalScrollBar (character-panel style),
+-- not WowTrimScrollBar / UIPanelScrollFrameTemplate (thick silver chrome).
+-- opts.overlayBar (default true): bar draws over content (feat cards).
+-- opts.overlayBar = false: content ends left of the bar (tables / section headers).
+function ns.CreateScrollArea(parent, opts)
+	opts = opts or {}
+	local overlayBar = opts.overlayBar
+	if overlayBar == nil then
+		overlayBar = true
+	end
+
+	local wrap = CreateFrame("Frame", nil, parent)
 	wrap:SetPoint("TOPLEFT", 4, -4)
 	wrap:SetPoint("BOTTOMRIGHT", -4, 4)
 
-	local scroll = CreateFrame("ScrollFrame", nil, wrap, "UIPanelScrollFrameTemplate")
-	scroll:SetPoint("TOPLEFT", 8, -8)
-	scroll:SetPoint("BOTTOMRIGHT", -28, 8)
+	local scrollBar
+	do
+		-- Prefer the slim character-sidebar bar first.
+		local templates = {
+			"MinimalScrollBar",
+			"WowMinimalScrollBar",
+			"UIPanelScrollBarMinimalTemplate",
+		}
+		for i = 1, #templates do
+			local ok, bar = pcall(CreateFrame, "EventFrame", nil, wrap, templates[i])
+			if not (ok and bar) then
+				ok, bar = pcall(CreateFrame, "Frame", nil, wrap, templates[i])
+			end
+			if ok and bar then
+				scrollBar = bar
+				break
+			end
+		end
+		if scrollBar then
+			if scrollBar.SetHideIfUnscrollable then
+				scrollBar:SetHideIfUnscrollable(true)
+			end
+			if scrollBar.SetWidth then
+				local w = scrollBar:GetWidth()
+				if not w or w > 14 then
+					scrollBar:SetWidth(10)
+				end
+			end
+		end
+	end
+
+	local scroll
+	do
+		local ok, sf = pcall(CreateFrame, "ScrollFrame", nil, wrap, "ScrollFrameTemplate")
+		if ok and sf then
+			scroll = sf
+		else
+			scroll = CreateFrame("ScrollFrame", nil, wrap, "UIPanelScrollFrameTemplate")
+		end
+	end
+
+	-- ScrollFrameTemplate may ship its own bar/steppers — hide those so we only
+	-- keep the single MinimalScrollBar (avoids the double down-arrow look).
+	local function HideBuiltinScrollChrome(sf)
+		if not sf then
+			return
+		end
+		local builtin = sf.ScrollBar or sf.scrollBar
+		if builtin and builtin ~= scrollBar then
+			builtin:Hide()
+			builtin:EnableMouse(false)
+			if builtin.ClearAllPoints then
+				builtin:ClearAllPoints()
+			end
+			if builtin.SetAlpha then
+				builtin:SetAlpha(0)
+			end
+			for _, key in ipairs({
+				"ScrollUpButton", "ScrollDownButton", "Back", "Forward",
+				"ThumbTexture", "Track",
+			}) do
+				local piece = builtin[key]
+				if piece and piece.Hide then
+					piece:Hide()
+				end
+			end
+		end
+		local name = sf.GetName and sf:GetName()
+		if name then
+			for _, suffix in ipairs({ "ScrollBar", "ScrollBarScrollUpButton", "ScrollBarScrollDownButton" }) do
+				local f = _G[name .. suffix]
+				if f and f ~= scrollBar and f.Hide then
+					f:Hide()
+					if f.EnableMouse then
+						f:EnableMouse(false)
+					end
+				end
+			end
+		end
+	end
+	HideBuiltinScrollChrome(scroll)
+
+	local function AnchorScrollAndBar()
+		if not scrollBar then
+			scroll:SetPoint("TOPLEFT", 2, -2)
+			scroll:SetPoint("BOTTOMRIGHT", -2, 2)
+			return
+		end
+		scrollBar:ClearAllPoints()
+		scroll:ClearAllPoints()
+		if overlayBar then
+			scroll:SetPoint("TOPLEFT", wrap, "TOPLEFT", 2, -2)
+			scroll:SetPoint("BOTTOMRIGHT", wrap, "BOTTOMRIGHT", -2, 2)
+			scrollBar:SetPoint("TOPRIGHT", wrap, "TOPRIGHT", -2, -4)
+			scrollBar:SetPoint("BOTTOMRIGHT", wrap, "BOTTOMRIGHT", -2, 4)
+		else
+			scrollBar:SetPoint("TOPRIGHT", wrap, "TOPRIGHT", -2, -4)
+			scrollBar:SetPoint("BOTTOMRIGHT", wrap, "BOTTOMRIGHT", -2, 4)
+			scroll:SetPoint("TOPLEFT", wrap, "TOPLEFT", 2, -2)
+			scroll:SetPoint("BOTTOMLEFT", wrap, "BOTTOMLEFT", 2, 2)
+			scroll:SetPoint("RIGHT", scrollBar, "LEFT", -4, 0)
+		end
+	end
+	AnchorScrollAndBar()
+
+	if scrollBar then
+		local wired = false
+		if ScrollUtil and ScrollUtil.InitScrollFrameWithScrollBar then
+			wired = pcall(ScrollUtil.InitScrollFrameWithScrollBar, scroll, scrollBar)
+		end
+		if not wired and scrollBar.Init then
+			wired = pcall(scrollBar.Init, scrollBar, scroll)
+		end
+		-- Init can re-anchor; restore our layout.
+		AnchorScrollAndBar()
+		HideBuiltinScrollChrome(scroll)
+
+		if not wired then
+			scroll.ScrollBar = scrollBar
+			scroll:SetScript("OnScrollRangeChanged", function(self, _x, yrange)
+				yrange = yrange or 0
+				if scrollBar.Update then
+					pcall(scrollBar.Update, scrollBar)
+				elseif scrollBar.SetMinMaxValues then
+					scrollBar:SetMinMaxValues(0, yrange)
+					local val = self:GetVerticalScroll() or 0
+					scrollBar:SetValue(math.min(val, yrange))
+				end
+				if scrollBar.SetShown and scrollBar.SetHideIfUnscrollable then
+					scrollBar:SetShown(yrange > 1)
+				end
+			end)
+			scroll:SetScript("OnVerticalScroll", function(self, offset)
+				if scrollBar.SetValue then
+					scrollBar:SetValue(offset or 0)
+				end
+			end)
+			scroll:EnableMouseWheel(true)
+			scroll:SetScript("OnMouseWheel", function(self, delta)
+				local cur = self:GetVerticalScroll() or 0
+				local maxV = self:GetVerticalScrollRange() or 0
+				local step = 40
+				self:SetVerticalScroll(math.max(0, math.min(maxV, cur - delta * step)))
+			end)
+		end
+	end
 
 	local child = CreateFrame("Frame", nil, scroll)
 	child:SetSize(1, 1)
 	scroll:SetScrollChild(child)
 
+	scroll:HookScript("OnSizeChanged", function(self, width)
+		local w = width or self:GetWidth() or 0
+		if w > 0 then
+			child:SetWidth(w)
+		end
+	end)
+
+	wrap.scrollBar = scrollBar
+	wrap.scroll = scroll
+	wrap.child = child
 	return wrap, scroll, child
 end
 
@@ -1078,14 +1767,22 @@ function ns.PlayUISound(kit, fallback)
 	end
 end
 
+-- Shared section / table chrome insets (Stats, Levels, Guild).
+local SECTION_INSET = 10
+local SECTION_TOP = -6
+local SECTION_BELOW = -6
+local COL_HEADER_H = 22
+
 function ns.ScrollLevelsToCurrent(level)
 	local scroll = ui.levelScroll
 	local child = ui.levelChild
 	if not scroll or not child or not level then
 		return
 	end
-	-- Row tops sit at 20 + (level-1)*ROW_HEIGHT inside the scroll child.
-	local rowTop = 20 + (level - 1) * ROW_HEIGHT
+	local sectionH = (ui.levelsSectionHeader and ui.levelsSectionHeader:GetHeight()) or 28
+	local colH = (ui.levelColHeader and ui.levelColHeader:GetHeight()) or COL_HEADER_H
+	local firstRowTop = math.abs(SECTION_TOP) + sectionH + math.abs(SECTION_BELOW) + colH
+	local rowTop = firstRowTop + (level - 1) * ROW_HEIGHT
 	local rowCenter = rowTop + (ROW_HEIGHT / 2)
 	local viewH = scroll:GetHeight() or 0
 	local childH = child:GetHeight() or 0
@@ -1148,59 +1845,168 @@ function ns.SetTab(id, silent)
 	end
 end
 
+local LEVEL_COL = {
+	pad = SECTION_INSET,
+	level = 48,
+	diff = 90,
+}
+
+local function LayoutLevelColumns(row)
+	if not row then
+		return
+	end
+	local pad = LEVEL_COL.pad
+	if row.level then
+		row.level:ClearAllPoints()
+		row.level:SetPoint("LEFT", pad, 0)
+		row.level:SetWidth(LEVEL_COL.level)
+		row.level:SetJustifyH("LEFT")
+	end
+	if row.xp then
+		row.xp:ClearAllPoints()
+		row.xp:SetPoint("RIGHT", -pad, 0)
+		row.xp:SetJustifyH("RIGHT")
+	end
+	if row.diff then
+		row.diff:ClearAllPoints()
+		row.diff:SetPoint("RIGHT", row.xp, "LEFT", -12, 0)
+		row.diff:SetWidth(LEVEL_COL.diff)
+		row.diff:SetJustifyH("RIGHT")
+	end
+end
+
 function ns.BuildLevelRows(parent)
-		local header = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	header:SetPoint("TOPLEFT", 8, -4)
-	header:SetText("LEVEL")
+	-- Section header IN the scroll child (same pattern as Stats "This Session").
+	local section = ns.CreateSectionHeader(parent, "Levels")
+	section:SetPoint("TOPLEFT", SECTION_INSET, SECTION_TOP)
+	section:SetPoint("TOPRIGHT", -SECTION_INSET, SECTION_TOP)
+	ui.levelsSectionHeader = section
 
-	local headerXp = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	headerXp:SetPoint("TOPRIGHT", -8, -4)
-	headerXp:SetText("XP REQUIRED")
+	local sectionH = section:GetHeight() or 28
+	local colY = SECTION_TOP - sectionH + SECTION_BELOW
 
+	local colHeader = CreateFrame("Frame", nil, parent)
+	colHeader:SetHeight(COL_HEADER_H)
+	colHeader:SetPoint("TOPLEFT", 0, colY)
+	colHeader:SetPoint("TOPRIGHT", 0, colY)
+	colHeader.bg = colHeader:CreateTexture(nil, "BACKGROUND")
+	colHeader.bg:SetAllPoints()
+	colHeader.bg:SetColorTexture(0.12, 0.10, 0.07, 0.95)
+	colHeader.level = colHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	colHeader.level:SetText("Level")
+	colHeader.level:SetTextColor(1, 0.82, 0)
+	colHeader.diff = colHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	colHeader.diff:SetText("To reach")
+	colHeader.diff:SetTextColor(1, 0.82, 0)
+	colHeader.xp = colHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	colHeader.xp:SetText("Total XP")
+	colHeader.xp:SetTextColor(1, 0.82, 0)
+	LayoutLevelColumns(colHeader)
+	ui.levelColHeader = colHeader
+
+	local firstRowY = colY - COL_HEADER_H
 	for level = 1, MAX_LEVEL do
 		local row = CreateFrame("Frame", nil, parent)
-		row:SetPoint("TOPLEFT", 0, -20 - (level - 1) * ROW_HEIGHT)
-		row:SetPoint("TOPRIGHT", 0, -20 - (level - 1) * ROW_HEIGHT)
+		local y = firstRowY - (level - 1) * ROW_HEIGHT
+		row:SetPoint("TOPLEFT", 0, y)
+		row:SetPoint("TOPRIGHT", 0, y)
 		row:SetHeight(ROW_HEIGHT)
 
 		row.bg = row:CreateTexture(nil, "BACKGROUND")
 		row.bg:SetAllPoints()
-		row.bg:Hide()
+		local odd = (level % 2) == 1
+		if odd then
+			row.bg:SetColorTexture(0.06, 0.05, 0.04, 0.92)
+		else
+			row.bg:SetColorTexture(0.17, 0.13, 0.09, 0.88)
+		end
+		row._ajhOdd = odd
 
 		row.level = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-		row.level:SetPoint("LEFT", 8, 0)
 		row.level:SetText(tostring(level))
 
 		row.xp = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-		row.xp:SetPoint("RIGHT", -8, 0)
 		row.xp:SetText(ns.FormatNumber(xpForLevel[level]))
 
 		row.diff = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-		row.diff:SetPoint("CENTER", 20, 0)
 		if level == 1 then
-			row.diff:SetText("")
+			row.diff:SetText("—")
 		else
 			row.diff:SetText("+" .. ns.FormatNumber(xpForLevel[level] - xpForLevel[level - 1]))
 		end
+		LayoutLevelColumns(row)
 
 		ui.levelRows[level] = row
 	end
 
-	parent:SetSize(300, 24 + MAX_LEVEL * ROW_HEIGHT)
+	parent:SetHeight(math.abs(firstRowY) + MAX_LEVEL * ROW_HEIGHT + 8)
 end
 
 function ns.UpdateLevelRows(currentLevel)
 	for level, row in pairs(ui.levelRows) do
 		if level == currentLevel then
-			row.bg:SetColorTexture(1, 0.82, 0, 0.18)
+			row.bg:SetColorTexture(0.28, 0.22, 0.08, 0.95)
 			row.bg:Show()
 			row.level:SetTextColor(1, 0.82, 0, 1)
 			row.xp:SetTextColor(1, 0.82, 0, 1)
+			row.diff:SetTextColor(1, 0.82, 0, 1)
 		else
-			row.bg:Hide()
-			row.level:SetTextColor(1, 1, 1, 1)
-			row.xp:SetTextColor(1, 1, 1, 1)
+			if row._ajhOdd then
+				row.bg:SetColorTexture(0.06, 0.05, 0.04, 0.92)
+			else
+				row.bg:SetColorTexture(0.17, 0.13, 0.09, 0.88)
+			end
+			row.bg:Show()
+			row.level:SetTextColor(0.95, 0.95, 0.92, 1)
+			row.xp:SetTextColor(0.95, 0.95, 0.92, 1)
+			row.diff:SetTextColor(0.75, 0.72, 0.65, 1)
 		end
+	end
+end
+
+-- Guild leaderboard column geometry (shared by header + rows).
+local BOARD_COL = {
+	pad = SECTION_INSET,
+	rank = 28,
+	level = 40,
+	jumps = 56,
+	feats = 72,
+}
+
+local function LayoutBoardColumns(row)
+	if not row then
+		return
+	end
+	local pad = BOARD_COL.pad
+	if row.rank then
+		row.rank:ClearAllPoints()
+		row.rank:SetPoint("LEFT", pad, 0)
+		row.rank:SetWidth(BOARD_COL.rank)
+		row.rank:SetJustifyH("CENTER")
+	end
+	if row.achs then
+		row.achs:ClearAllPoints()
+		row.achs:SetPoint("RIGHT", -pad, 0)
+		row.achs:SetWidth(BOARD_COL.feats)
+		row.achs:SetJustifyH("RIGHT")
+	end
+	if row.jumps then
+		row.jumps:ClearAllPoints()
+		row.jumps:SetPoint("RIGHT", row.achs, "LEFT", -8, 0)
+		row.jumps:SetWidth(BOARD_COL.jumps)
+		row.jumps:SetJustifyH("RIGHT")
+	end
+	if row.level then
+		row.level:ClearAllPoints()
+		row.level:SetPoint("RIGHT", row.jumps, "LEFT", -8, 0)
+		row.level:SetWidth(BOARD_COL.level)
+		row.level:SetJustifyH("RIGHT")
+	end
+	if row.name then
+		row.name:ClearAllPoints()
+		row.name:SetPoint("LEFT", row.rank, "RIGHT", 8, 0)
+		row.name:SetPoint("RIGHT", row.level, "LEFT", -8, 0)
+		row.name:SetJustifyH("LEFT")
 	end
 end
 
@@ -1211,32 +2017,23 @@ function ns.EnsureBoardRow(parent, index)
 	end
 
 	row = CreateFrame("Frame", nil, parent)
-	row:SetHeight(ROW_HEIGHT)
+	row:SetHeight(22)
+
+	row.bg = row:CreateTexture(nil, "BACKGROUND")
+	row.bg:SetAllPoints()
+	local odd = (index % 2) == 1
+	if odd then
+		row.bg:SetColorTexture(0.06, 0.05, 0.04, 0.92)
+	else
+		row.bg:SetColorTexture(0.17, 0.13, 0.09, 0.88)
+	end
 
 	row.rank = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	row.rank:SetPoint("LEFT", 8, 0)
-	row.rank:SetWidth(28)
-	row.rank:SetJustifyH("LEFT")
-
 	row.name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	row.name:SetPoint("LEFT", 40, 0)
-	row.name:SetPoint("RIGHT", -160, 0)
-	row.name:SetJustifyH("LEFT")
-
 	row.level = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	row.level:SetPoint("RIGHT", -112, 0)
-	row.level:SetWidth(36)
-	row.level:SetJustifyH("RIGHT")
-
 	row.jumps = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	row.jumps:SetPoint("RIGHT", -52, 0)
-	row.jumps:SetWidth(56)
-	row.jumps:SetJustifyH("RIGHT")
-
 	row.achs = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	row.achs:SetPoint("RIGHT", -8, 0)
-	row.achs:SetWidth(40)
-	row.achs:SetJustifyH("RIGHT")
+	LayoutBoardColumns(row)
 
 	ui.boardRows[index] = row
 	return row
@@ -1281,22 +2078,23 @@ function ns.UpdateLeaderboard()
 		return a.jumps > b.jumps
 	end)
 
-	if ui.guildEmpty then
+	-- Hint under the section header — never overlay the table.
+	if ui.guildHint then
 		if not IsInGuild() then
-			ui.guildEmpty:SetText("Join a guild to share a Jump Habit leaderboard.")
-			ui.guildEmpty:Show()
+			ui.guildHint:SetText("Join a guild to share Jump Habit scores with others.")
+			ui.guildHint:Show()
 		elseif #entries <= 1 then
-			ui.guildEmpty:SetText("Waiting for guildmates with AJH? Open this tab while they are online.")
-			if #entries == 0 then
-				ui.guildEmpty:Show()
-			else
-				-- Still show your row; keep the hint visible above is awkward.
-				-- Hide empty state when at least you are listed.
-				ui.guildEmpty:Hide()
-			end
+			ui.guildHint:SetText("Waiting for guildmates with AJH — open this tab while they are online.")
+			ui.guildHint:Show()
 		else
-			ui.guildEmpty:Hide()
+			ui.guildHint:Hide()
 		end
+	end
+	if ui.guildEmpty then
+		ui.guildEmpty:Hide()
+	end
+	if ui.LayoutGuildScroll then
+		ui.LayoutGuildScroll()
 	end
 
 	local child = ui.boardChild
@@ -1304,47 +2102,55 @@ function ns.UpdateLeaderboard()
 		return
 	end
 
+	local scroll = ui.boardScroll
+	local contentW = (scroll and scroll:GetWidth()) or child:GetWidth() or 0
+	if contentW > 80 then
+		child:SetWidth(contentW)
+	end
+
+	local headerH = (ui.boardColHeader and ui.boardColHeader:GetHeight()) or COL_HEADER_H
+	local y = -headerH
+
 	for i, entry in ipairs(entries) do
 		local row = ns.EnsureBoardRow(child, i)
 		row:ClearAllPoints()
-		row:SetPoint("TOPLEFT", 0, -20 - (i - 1) * ROW_HEIGHT)
-		row:SetPoint("TOPRIGHT", 0, -20 - (i - 1) * ROW_HEIGHT)
+		row:SetPoint("TOPLEFT", 0, y - (i - 1) * 22)
+		row:SetPoint("TOPRIGHT", 0, y - (i - 1) * 22)
 		row:Show()
+		LayoutBoardColumns(row)
 
 		row.rank:SetText(tostring(i))
 		row.name:SetText(entry.name)
 		row.level:SetText(tostring(entry.level))
 		row.jumps:SetText(ns.FormatNumber(entry.jumps))
-		row.achs:SetText(string.format("%d/%d", entry.achs, #ACHIEVEMENTS))
+		row.achs:SetText(string.format("%d / %d", entry.achs, #ACHIEVEMENTS))
 
 		local mine = entry.key == key
-		if mine then
-			row.rank:SetTextColor(1, 0.82, 0, 1)
-			row.name:SetTextColor(1, 0.82, 0, 1)
-			row.level:SetTextColor(1, 0.82, 0, 1)
-			row.jumps:SetTextColor(1, 0.82, 0, 1)
-			row.achs:SetTextColor(1, 0.82, 0, 1)
-		else
-			row.rank:SetTextColor(1, 1, 1, 1)
-			row.name:SetTextColor(1, 1, 1, 1)
-			row.level:SetTextColor(1, 1, 1, 1)
-			row.jumps:SetTextColor(1, 1, 1, 1)
-			row.achs:SetTextColor(1, 1, 1, 1)
-		end
+		local gold = mine and 1 or 0.95
+		local g2 = mine and 0.82 or 0.95
+		local g3 = mine and 0 or 0.92
+		row.rank:SetTextColor(gold, g2, g3, 1)
+		row.name:SetTextColor(gold, g2, g3, 1)
+		row.level:SetTextColor(gold, g2, g3, 1)
+		row.jumps:SetTextColor(gold, g2, g3, 1)
+		row.achs:SetTextColor(gold, g2, g3, 1)
 	end
 
 	for i = #entries + 1, #ui.boardRows do
 		ui.boardRows[i]:Hide()
 	end
 
-	child:SetSize(300, 24 + math.max(#entries, 1) * ROW_HEIGHT)
+	child:SetHeight(headerH + math.max(#entries, 1) * 22 + 8)
+	if scroll and scroll.UpdateScrollChildRect then
+		scroll:UpdateScrollChildRect()
+	end
 end
 
-local ACH_ROW_HEIGHT = 48
+local ACH_ROW_HEIGHT = 36
 local FEAT_CAT_COLS = 2
 local FEAT_CAT_CARD_HEIGHT = 138
-local FEAT_CAT_CARD_GAP = 12
-local FEAT_CAT_PAD = 10
+local FEAT_CAT_CARD_GAP = 4
+local FEAT_CAT_PAD = 2
 local FEAT_CAT_ICON = 42
 local FEAT_CAT_BAR_H = 18
 local FEAT_CAT_INSET = 8
@@ -1372,21 +2178,42 @@ function ns.HideFeatRows(rows)
 	end
 end
 
-function ns.StyleFeatItemRow(row, ach, done)
+function ns.StyleFeatItemRow(row, ach, done, stripeIndex)
+	row.featId = ach and ach.id or nil
 	row.title:SetText(ach.name)
 	row.desc:SetText(ach.desc)
+	local odd = ((stripeIndex or 1) % 2) == 1
+	local tracked = (not done) and ach and ns.IsFeatTracked(ach.id)
 	if done then
 		row.icon:SetTexture("Interface\\RaidFrame\\ReadyCheck-Ready")
-		row.bg:SetColorTexture(1, 0.82, 0, 0.12)
-		row.bg:Show()
+		row.bg:SetColorTexture(0.28, 0.22, 0.08, 0.95)
 		row.title:SetTextColor(1, 0.82, 0, 1)
-		row.desc:SetTextColor(1, 1, 1, 1)
+		row.desc:SetTextColor(0.95, 0.90, 0.75, 1)
 	else
-		row.icon:SetTexture("Interface\\GossipFrame\\IncompleteQuestIcon")
-		row.bg:Hide()
-		row.title:SetTextColor(1, 1, 1, 1)
-		row.desc:SetTextColor(0.7, 0.7, 0.7, 1)
+		if tracked then
+			-- Same frog as the objective tracker — not a checkmark (that reads as "done").
+			row.icon:SetTexture("Interface\\AddOns\\AJH\\AJH-gold-frog")
+			if row.icon.SetTexCoord then
+				row.icon:SetTexCoord(0.06, 0.94, 0.06, 0.94)
+			end
+			row.bg:SetColorTexture(0.20, 0.16, 0.06, 0.95)
+			row.title:SetTextColor(1, 0.88, 0.35, 1)
+			row.desc:SetTextColor(0.90, 0.84, 0.60, 1)
+		else
+			row.icon:SetTexture("Interface\\GossipFrame\\IncompleteQuestIcon")
+			if row.icon.SetTexCoord then
+				row.icon:SetTexCoord(0, 1, 0, 1)
+			end
+			if odd then
+				row.bg:SetColorTexture(0.06, 0.05, 0.04, 0.92)
+			else
+				row.bg:SetColorTexture(0.17, 0.13, 0.09, 0.88)
+			end
+			row.title:SetTextColor(0.95, 0.95, 0.92, 1)
+			row.desc:SetTextColor(0.72, 0.70, 0.65, 1)
+		end
 	end
+	row.bg:Show()
 end
 
 function ns.EnsureFeatItemRow(i)
@@ -1395,28 +2222,125 @@ function ns.EnsureFeatItemRow(i)
 	if row then
 		return row
 	end
-	row = CreateFrame("Frame", nil, child)
+	row = CreateFrame("Button", nil, child)
 	row:SetHeight(ACH_ROW_HEIGHT)
+	row:RegisterForClicks("LeftButtonUp")
+	row:EnableMouse(true)
 
 	row.bg = row:CreateTexture(nil, "BACKGROUND")
 	row.bg:SetAllPoints()
 
 	row.icon = row:CreateTexture(nil, "ARTWORK")
 	row.icon:SetSize(20, 20)
-	row.icon:SetPoint("LEFT", 10, 0)
+	row.icon:SetPoint("LEFT", SECTION_INSET, 0)
 
 	row.title = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	row.title:SetPoint("TOPLEFT", 40, -8)
-	row.title:SetPoint("TOPRIGHT", -10, -8)
+	row.title:SetPoint("TOPLEFT", SECTION_INSET + 28, -5)
+	row.title:SetPoint("TOPRIGHT", -SECTION_INSET, -5)
 	row.title:SetJustifyH("LEFT")
+	row.title:SetWordWrap(false)
+	if row.title.SetMaxLines then
+		row.title:SetMaxLines(1)
+	end
 
 	row.desc = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	row.desc:SetPoint("TOPLEFT", row.title, "BOTTOMLEFT", 0, -2)
-	row.desc:SetPoint("RIGHT", -10, 0)
+	row.desc:SetPoint("TOPLEFT", row.title, "BOTTOMLEFT", 0, -1)
+	row.desc:SetPoint("RIGHT", -SECTION_INSET, 0)
 	row.desc:SetJustifyH("LEFT")
+	row.desc:SetWordWrap(false)
+	if row.desc.SetMaxLines then
+		row.desc:SetMaxLines(1)
+	end
+
+	row:SetScript("OnClick", function(self)
+		if not self.featId then
+			return
+		end
+		if IsShiftKeyDown() then
+			ns.ToggleFeatTrack(self.featId)
+			if ns.UpdateAchievements then
+				ns.UpdateAchievements()
+			end
+			ns.PlayUISound("IG_MAINMENU_OPTION_CHECKBOX_ON", 856)
+		end
+	end)
+	row:SetScript("OnEnter", function(self)
+		if not self.featId then
+			return
+		end
+		local ach = ns.FindAchievement and ns.FindAchievement(self.featId)
+		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+		GameTooltip:SetText(ach and ach.name or self.featId, 1, 0.82, 0)
+		if ach and ach.desc then
+			GameTooltip:AddLine(ach.desc, 0.9, 0.9, 0.9, true)
+		end
+		local done = ns.DB().achievements[self.featId] ~= nil
+		if done then
+			GameTooltip:AddLine("Completed", 0.4, 0.9, 0.4)
+		elseif ns.IsFeatTracked(self.featId) then
+			GameTooltip:AddLine("Shift-click to stop tracking", 0.65, 0.65, 0.65)
+		else
+			GameTooltip:AddLine("Shift-click to track on the objective tracker", 0.65, 0.65, 0.65)
+		end
+		GameTooltip:Show()
+	end)
+	row:SetScript("OnLeave", function()
+		GameTooltip:Hide()
+	end)
 
 	ui.achRows[i] = row
 	return row
+end
+
+-- Feat cat chrome: thin gold double-line (UI-Tooltip-Border) — same family as
+-- SpellBook profession / First Aid panels. Forever's InsetFrameTemplate NineSlice
+-- is a thick grey metal bevel and is the wrong asset.
+local FEAT_CAT_BACKDROP = {
+	bgFile = "Interface\\Buttons\\WHITE8X8",
+	edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+	tile = true,
+	edgeSize = 14,
+	insets = { left = 4, right = 4, top = 4, bottom = 4 },
+}
+
+local function ApplyFeatCatBackdrop(frame, borderR, borderG, borderB, borderA, fillR, fillG, fillB, fillA)
+	if not (frame and frame.SetBackdrop) then
+		return
+	end
+	-- Prefer a live profession panel's backdrop when available (exact same assets).
+	local donor
+	for _, name in ipairs({
+		"PrimaryProfession1",
+		"PrimaryProfession2",
+		"SecondaryProfession1",
+		"SecondaryProfession2",
+		"SecondaryProfession3",
+	}) do
+		local f = _G[name]
+		if f and f.backdropInfo and f.backdropInfo.edgeFile then
+			donor = f
+			break
+		end
+	end
+	if donor and donor.backdropInfo then
+		frame:SetBackdrop(donor.backdropInfo)
+		if donor.GetBackdropColor and frame.SetBackdropColor then
+			local r, g, b, a = donor:GetBackdropColor()
+			frame:SetBackdropColor(fillR or r or 0.1, fillG or g or 0.12, fillB or b or 0.1, fillA or a or 0.96)
+		else
+			frame:SetBackdropColor(fillR or 0.10, fillG or 0.12, fillB or 0.10, fillA or 0.96)
+		end
+		if donor.GetBackdropBorderColor and frame.SetBackdropBorderColor then
+			local r, g, b, a = donor:GetBackdropBorderColor()
+			frame:SetBackdropBorderColor(borderR or r or 0.7, borderG or g or 0.6, borderB or b or 0.35, borderA or a or 1)
+		else
+			frame:SetBackdropBorderColor(borderR or 0.72, borderG or 0.62, borderB or 0.35, borderA or 1)
+		end
+	else
+		frame:SetBackdrop(FEAT_CAT_BACKDROP)
+		frame:SetBackdropColor(fillR or 0.10, fillG or 0.12, fillB or 0.10, fillA or 0.96)
+		frame:SetBackdropBorderColor(borderR or 0.72, borderG or 0.62, borderB or 0.35, borderA or 1)
+	end
 end
 
 function ns.EnsureFeatCategoryRow(i)
@@ -1425,52 +2349,25 @@ function ns.EnsureFeatCategoryRow(i)
 	if row then
 		return row
 	end
-	-- Category tiles: compact 2x2 cards (layout applied in UpdateAchievements).
-	row = CreateFrame("Button", nil, child)
+	-- Category tiles: tooltip-border gold box (First Aid style), not Inset NineSlice.
+	row = CreateFrame("Button", nil, child, BackdropTemplateMixin and "BackdropTemplate" or nil)
 	row:SetHeight(FEAT_CAT_CARD_HEIGHT)
 	row:RegisterForClicks("LeftButtonUp")
+	ApplyFeatCatBackdrop(row)
 
-	row.shadow = row:CreateTexture(nil, "BACKGROUND", nil, -1)
-	row.shadow:SetPoint("TOPLEFT", 4, -4)
-	row.shadow:SetPoint("BOTTOMRIGHT", 0, 0)
-	row.shadow:SetColorTexture(0, 0, 0, 0.4)
-
-	row.bg = row:CreateTexture(nil, "BACKGROUND")
-	row.bg:SetPoint("TOPLEFT", 1, -1)
-	row.bg:SetPoint("BOTTOMRIGHT", -1, 1)
-	row.bg:SetColorTexture(0.10, 0.12, 0.10, 0.96)
-
-	-- Thin 1px rim (same language as Habit bar edges ? not a fat tooltip stud border).
-	local function CardEdge()
-		local edge = row:CreateTexture(nil, "OVERLAY", nil, 7)
-		edge:SetColorTexture(0.72, 0.62, 0.28, 0.95)
-		edge:SetSize(1, 1)
-		return edge
-	end
-	local eTop = CardEdge()
-	eTop:SetPoint("TOPLEFT", row.bg, "TOPLEFT", 0, 0)
-	eTop:SetPoint("TOPRIGHT", row.bg, "TOPRIGHT", 0, 0)
-	local eBottom = CardEdge()
-	eBottom:SetPoint("BOTTOMLEFT", row.bg, "BOTTOMLEFT", 0, 0)
-	eBottom:SetPoint("BOTTOMRIGHT", row.bg, "BOTTOMRIGHT", 0, 0)
-	local eLeft = CardEdge()
-	eLeft:SetPoint("TOPLEFT", row.bg, "TOPLEFT", 0, 0)
-	eLeft:SetPoint("BOTTOMLEFT", row.bg, "BOTTOMLEFT", 0, 0)
-	local eRight = CardEdge()
-	eRight:SetPoint("TOPRIGHT", row.bg, "TOPRIGHT", 0, 0)
-	eRight:SetPoint("BOTTOMRIGHT", row.bg, "BOTTOMRIGHT", 0, 0)
-	row.cardEdges = { eTop, eBottom, eLeft, eRight }
+	row.bg = row -- fill driven via SetBackdropColor
+	row.box = row
 
 	row.hl = row:CreateTexture(nil, "HIGHLIGHT")
-	row.hl:SetPoint("TOPLEFT", row.bg, "TOPLEFT", 1, -1)
-	row.hl:SetPoint("BOTTOMRIGHT", row.bg, "BOTTOMRIGHT", -1, 1)
+	row.hl:SetPoint("TOPLEFT", 5, -5)
+	row.hl:SetPoint("BOTTOMRIGHT", -5, 5)
 	row.hl:SetColorTexture(1, 0.9, 0.45, 0.10)
 
 	-- Habit-style XP bar at the bottom: tooltip chrome + gold StatusBar + on-bar text.
 	row.barWrap = CreateFrame("Frame", nil, row)
 	row.barWrap:SetHeight(FEAT_CAT_BAR_H)
-	row.barWrap:SetPoint("BOTTOMLEFT", row.bg, "BOTTOMLEFT", FEAT_CAT_INSET, FEAT_CAT_INSET)
-	row.barWrap:SetPoint("BOTTOMRIGHT", row.bg, "BOTTOMRIGHT", -FEAT_CAT_INSET, FEAT_CAT_INSET)
+	row.barWrap:SetPoint("BOTTOMLEFT", FEAT_CAT_INSET + 2, FEAT_CAT_INSET + 2)
+	row.barWrap:SetPoint("BOTTOMRIGHT", -(FEAT_CAT_INSET + 2), FEAT_CAT_INSET + 2)
 	row.barWrap:SetFrameLevel(row:GetFrameLevel() + 2)
 
 	local barBorder = CreateFrame("Frame", nil, row.barWrap, BackdropTemplateMixin and "BackdropTemplate" or nil)
@@ -1505,7 +2402,8 @@ function ns.EnsureFeatCategoryRow(i)
 	track:SetColorTexture(0.08, 0.07, 0.04, 1)
 
 	-- Count lives on the bar (same place as Habit "Jump Habit X/Y").
-	row.progress = row.bar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	-- Parent to the border frame so the tooltip edge chrome cannot cover it.
+	row.progress = barBorder:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 	row.progress:SetPoint("CENTER", row.bar, "CENTER", 0, 0)
 	row.progress:SetTextColor(1, 1, 1, 1)
 	do
@@ -1514,11 +2412,15 @@ function ns.EnsureFeatCategoryRow(i)
 			row.progress:SetFont(fontPath, fontSize or 11, "OUTLINE")
 		end
 	end
+	if row.progress.SetShadowOffset then
+		row.progress:SetShadowOffset(0, 0)
+		row.progress:SetShadowColor(0, 0, 0, 0)
+	end
 
 	-- Icon (achievement-themed art; thin gold rim).
 	row.iconBorder = CreateFrame("Frame", nil, row)
 	row.iconBorder:SetSize(FEAT_CAT_ICON, FEAT_CAT_ICON)
-	row.iconBorder:SetPoint("TOP", row.bg, "TOP", 0, -FEAT_CAT_INSET - 2)
+	row.iconBorder:SetPoint("TOP", row.bg, "TOP", 0, -FEAT_CAT_INSET - 4)
 	row.iconBorder:SetFrameLevel(row:GetFrameLevel() + 2)
 	local iconBg = row.iconBorder:CreateTexture(nil, "BACKGROUND")
 	iconBg:SetAllPoints()
@@ -1554,8 +2456,8 @@ function ns.EnsureFeatCategoryRow(i)
 
 	row.title = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	row.title:SetPoint("TOP", row.iconBorder, "BOTTOM", 0, -8)
-	row.title:SetPoint("LEFT", row.bg, "LEFT", FEAT_CAT_INSET, 0)
-	row.title:SetPoint("RIGHT", row.bg, "RIGHT", -FEAT_CAT_INSET, 0)
+	row.title:SetPoint("LEFT", row.bg, "LEFT", FEAT_CAT_INSET + 2, 0)
+	row.title:SetPoint("RIGHT", row.bg, "RIGHT", -(FEAT_CAT_INSET + 2), 0)
 	row.title:SetJustifyH("CENTER")
 	row.title:SetTextColor(1, 0.86, 0.25, 1)
 	if row.title.SetMaxLines then
@@ -1566,8 +2468,8 @@ function ns.EnsureFeatCategoryRow(i)
 	-- Description: room to wrap; hover tooltip always shows the full line.
 	row.desc = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	row.desc:SetPoint("TOP", row.title, "BOTTOM", 0, -5)
-	row.desc:SetPoint("LEFT", row.bg, "LEFT", FEAT_CAT_INSET + 2, 0)
-	row.desc:SetPoint("RIGHT", row.bg, "RIGHT", -(FEAT_CAT_INSET + 2), 0)
+	row.desc:SetPoint("LEFT", row.bg, "LEFT", FEAT_CAT_INSET + 4, 0)
+	row.desc:SetPoint("RIGHT", row.bg, "RIGHT", -(FEAT_CAT_INSET + 4), 0)
 	row.desc:SetPoint("BOTTOM", row.barWrap, "TOP", 0, 6)
 	row.desc:SetJustifyH("CENTER")
 	row.desc:SetJustifyV("TOP")
@@ -1576,7 +2478,6 @@ function ns.EnsureFeatCategoryRow(i)
 	if row.desc.SetNonSpaceWrap then
 		row.desc:SetNonSpaceWrap(false)
 	end
-	-- No MaxLines / ellipsis ? tooltip covers overflow if any.
 
 	row:SetScript("OnEnter", function(self)
 		if not self.categoryName then
@@ -1633,27 +2534,11 @@ function ns.UpdateAchievements()
 
 	if ui.featBack then
 		ui.featBack:SetShown(inCategory)
-	end
-	if ui.achSummaryIcon then
-		ui.achSummaryIcon:ClearAllPoints()
-		if inCategory and ui.featBack then
-			ui.achSummaryIcon:SetPoint("LEFT", ui.featBack, "RIGHT", 8, 0)
-		else
-			ui.achSummaryIcon:SetPoint("TOPLEFT", 12, -14)
-		end
-		ui.achSummaryIcon:Show()
-	end
-	if ui.achSummary then
-		ui.achSummary:ClearAllPoints()
-		if ui.achSummaryIcon then
-			ui.achSummary:SetPoint("LEFT", ui.achSummaryIcon, "RIGHT", 6, 0)
-		elseif inCategory and ui.featBack then
-			ui.achSummary:SetPoint("LEFT", ui.featBack, "RIGHT", 8, 0)
-		else
-			ui.achSummary:SetPoint("TOPLEFT", 12, -16)
-		end
+		ui.featBack:ClearAllPoints()
+		ui.featBack:SetPoint("BOTTOMRIGHT", -8, 8)
 	end
 
+	-- Detail: progress bar + frog above the section header; categories: centred count + frog.
 	if inCategory then
 		ns.HideFeatRows(ui.featCatRows)
 
@@ -1668,28 +2553,101 @@ function ns.UpdateAchievements()
 		local feats = ns.GetFeatsInCategory(view)
 		local earned, total = ns.CountCategoryProgress(view)
 
+		if ui.featDetailBar then
+			local maxV = (total and total > 0) and total or 1
+			ui.featDetailBar:SetMinMaxValues(0, maxV)
+			ui.featDetailBar:SetValue(math.min(earned or 0, maxV))
+			if earned >= total and total > 0 then
+				ui.featDetailBar:SetStatusBarColor(1, 0.88, 0.2, 1)
+			else
+				ui.featDetailBar:SetStatusBarColor(1, 0.82, 0, 1)
+			end
+		end
+		if ui.featDetailBarText then
+			ui.featDetailBarText:SetText(string.format("%d / %d", earned or 0, total or 0))
+		end
+		if ui.featDetailBarWrap then
+			ui.featDetailBarWrap._earned = earned or 0
+			ui.featDetailBarWrap._total = total or 0
+		end
+		if ui.LayoutFeatSummaryCluster then
+			ui.LayoutFeatSummaryCluster()
+		end
+
+		if ui.achSummaryCluster and ui.achSummaryIcon then
+			ui.achSummaryCluster:ClearAllPoints()
+			ui.achSummaryCluster:SetPoint("TOP", 0, SECTION_TOP)
+			ui.achSummaryCluster:Show()
+			ui.achSummaryIcon:Show()
+		end
+
+		if ui.featDetailHeader then
+			ui.featDetailHeader:Show()
+			local label = ui.featDetailHeader.label
+				or ui.featDetailHeader.Text
+				or (ui.featDetailHeader.GetFontString and ui.featDetailHeader:GetFontString())
+			if ui.featDetailHeader.SetText then
+				ui.featDetailHeader:SetText(catName)
+			end
+			if label and label.SetText then
+				label:SetText(catName)
+			end
+			local clusterH = (ui.achSummaryCluster and ui.achSummaryCluster:GetHeight()) or 28
+			ui.featDetailHeader:ClearAllPoints()
+			ui.featDetailHeader:SetPoint("TOPLEFT", SECTION_INSET, SECTION_TOP - clusterH + SECTION_BELOW)
+			ui.featDetailHeader:SetPoint("TOPRIGHT", -SECTION_INSET, SECTION_TOP - clusterH + SECTION_BELOW)
+		end
+
+		if ui.LayoutFeatScroll then
+			ui.LayoutFeatScroll(true)
+		end
+
+		local scroll = ui.achScroll
+		local contentW = (scroll and scroll:GetWidth()) or child:GetWidth() or 0
+		if contentW > 80 then
+			child:SetWidth(contentW)
+		end
+
 		for i, ach in ipairs(feats) do
 			local row = ns.EnsureFeatItemRow(i)
 			row:ClearAllPoints()
 			row:SetPoint("TOPLEFT", 0, -(i - 1) * ACH_ROW_HEIGHT)
 			row:SetPoint("TOPRIGHT", 0, -(i - 1) * ACH_ROW_HEIGHT)
 			row:Show()
-			ns.StyleFeatItemRow(row, ach, ns.DB().achievements[ach.id] ~= nil)
+			ns.StyleFeatItemRow(row, ach, ns.DB().achievements[ach.id] ~= nil, i)
 		end
 		for i = #feats + 1, #ui.achRows do
 			ui.achRows[i]:Hide()
 		end
 
-		child:SetSize(300, math.max(#feats, 1) * ACH_ROW_HEIGHT)
-		if ui.achSummary then
-			ui.achSummary:SetText(string.format("%s - %d / %d", catName, earned, total))
+		child:SetHeight(math.max(#feats, 1) * ACH_ROW_HEIGHT + 8)
+		if scroll and scroll.UpdateScrollChildRect then
+			scroll:UpdateScrollChildRect()
 		end
 	else
+		if ui.featDetailHeader then
+			ui.featDetailHeader:Hide()
+		end
+		if ui.achSummaryCluster and ui.achSummaryIcon then
+			ui.achSummaryCluster:ClearAllPoints()
+			ui.achSummaryCluster:SetPoint("TOP", 0, SECTION_TOP)
+			ui.achSummaryCluster:Show()
+			ui.achSummaryIcon:Show()
+		end
+		if ui.LayoutFeatScroll then
+			ui.LayoutFeatScroll(false)
+		end
+
 		ns.HideFeatRows(ui.achRows)
 
-		local contentW = child:GetWidth()
-		if not contentW or contentW < 80 then
+		local scroll = ui.achScroll
+		local contentW = (scroll and scroll:GetWidth()) or child:GetWidth() or 0
+		if contentW < 80 then
 			contentW = 300
+		else
+			-- Leave a small right margin (~10px) so cards aren't flush to the bar.
+			contentW = contentW - 10
+			child:SetWidth(contentW)
 		end
 		local cols = FEAT_CAT_COLS
 		local gaps = cols - 1
@@ -1706,11 +2664,14 @@ function ns.UpdateAchievements()
 		end
 
 		local function SetCardEdgeColor(row, r, g, b, a)
-			if not row.cardEdges then
-				return
+			if row.SetBackdropBorderColor then
+				row:SetBackdropBorderColor(r, g, b, a or 1)
 			end
-			for _, edge in ipairs(row.cardEdges) do
-				edge:SetColorTexture(r, g, b, a or 1)
+		end
+
+		local function SetCardFill(row, r, g, b, a)
+			if row.SetBackdropColor then
+				row:SetBackdropColor(r, g, b, a or 1)
 			end
 		end
 
@@ -1740,19 +2701,19 @@ function ns.UpdateAchievements()
 			SetCategoryBar(row, earned, total)
 			if earned >= total and total > 0 then
 				row.title:SetTextColor(1, 0.88, 0.2, 1)
-				row.bg:SetColorTexture(0.18, 0.16, 0.08, 0.97)
+				SetCardFill(row, 0.18, 0.16, 0.08, 0.97)
 				row.bar:SetStatusBarColor(1, 0.88, 0.2, 1)
 				SetCardEdgeColor(row, 1, 0.82, 0, 1)
 				SetIconEdgeColor(row, 1, 0.86, 0.25, 1)
 			elseif earned > 0 then
 				row.title:SetTextColor(1, 0.86, 0.35, 1)
-				row.bg:SetColorTexture(0.11, 0.13, 0.10, 0.97)
+				SetCardFill(row, 0.11, 0.13, 0.10, 0.97)
 				row.bar:SetStatusBarColor(1, 0.82, 0, 1)
 				SetCardEdgeColor(row, 0.85, 0.72, 0.32, 0.95)
 				SetIconEdgeColor(row, 0.95, 0.8, 0.3, 0.95)
 			else
 				row.title:SetTextColor(1, 0.82, 0.3, 1)
-				row.bg:SetColorTexture(0.09, 0.11, 0.09, 0.96)
+				SetCardFill(row, 0.09, 0.11, 0.09, 0.96)
 				row.bar:SetStatusBarColor(1, 0.82, 0, 1)
 				SetCardEdgeColor(row, 0.62, 0.55, 0.32, 0.9)
 				SetIconEdgeColor(row, 0.75, 0.65, 0.32, 0.9)
@@ -1775,8 +2736,25 @@ function ns.UpdateAchievements()
 			contentW,
 			FEAT_CAT_PAD * 2 + rowsNeeded * FEAT_CAT_CARD_HEIGHT + math.max(0, rowsNeeded - 1) * FEAT_CAT_CARD_GAP
 		)
-		if ui.achSummary then
-			ui.achSummary:SetText(string.format("%d / %d feats", totalEarned, #ACHIEVEMENTS))
+		if ui.featDetailBar then
+			local maxV = (#ACHIEVEMENTS > 0) and #ACHIEVEMENTS or 1
+			ui.featDetailBar:SetMinMaxValues(0, maxV)
+			ui.featDetailBar:SetValue(math.min(totalEarned or 0, maxV))
+			if totalEarned >= #ACHIEVEMENTS and #ACHIEVEMENTS > 0 then
+				ui.featDetailBar:SetStatusBarColor(1, 0.88, 0.2, 1)
+			else
+				ui.featDetailBar:SetStatusBarColor(1, 0.82, 0, 1)
+			end
+		end
+		if ui.featDetailBarText then
+			ui.featDetailBarText:SetText(string.format("%d / %d", totalEarned or 0, #ACHIEVEMENTS))
+		end
+		if ui.featDetailBarWrap then
+			ui.featDetailBarWrap._earned = totalEarned or 0
+			ui.featDetailBarWrap._total = #ACHIEVEMENTS
+		end
+		if ui.LayoutFeatSummaryCluster then
+			ui.LayoutFeatSummaryCluster()
 		end
 	end
 end
@@ -1803,6 +2781,7 @@ function ns.BuildPanel()
 	if ButtonFrameTemplate_HideButtonBar then
 		ButtonFrameTemplate_HideButtonBar(S.panel)
 	end
+	ns.ApplyModernPanelChrome(S.panel)
 	if S.panel.SetTitle then
 		S.panel:SetTitle("Archindula's Jump Habit")
 	elseif S.panel.TitleContainer and S.panel.TitleContainer.TitleText then
@@ -1810,6 +2789,7 @@ function ns.BuildPanel()
 	elseif S.panel.TitleText then
 		S.panel.TitleText:SetText("Archindula's Jump Habit")
 	end
+	-- Frog portrait (same path as the release — works on Forever).
 	if S.panel.SetPortraitToTexture then
 		S.panel:SetPortraitToTexture(FROG_ICON)
 	elseif S.panel.SetPortraitToAsset then
@@ -1819,6 +2799,12 @@ function ns.BuildPanel()
 		if portrait then
 			portrait:SetTexture(FROG_ICON)
 		end
+	end
+	if S.panel.PortraitContainer then
+		S.panel.PortraitContainer:Show()
+	end
+	if S.panel.portrait then
+		S.panel.portrait:Show()
 	end
 	if S.panel.TitleContainer then
 		S.panel.TitleContainer:EnableMouse(true)
@@ -1834,27 +2820,35 @@ function ns.BuildPanel()
 	local content = CreateFrame("Frame", nil, S.panel)
 	if S.panel.Inset then
 		S.panel.Inset:ClearAllPoints()
-		-- Equal left/right so the InsetFrame edge sliver shows on both sides.
-		S.panel.Inset:SetPoint("TOPLEFT", 8, -62)
-		S.panel.Inset:SetPoint("BOTTOMRIGHT", -12, 28)
+		-- Pull inset up under the title and down over the button-bar strip.
+		S.panel.Inset:SetPoint("TOPLEFT", 8, -28)
+		S.panel.Inset:SetPoint("BOTTOMRIGHT", -8, 6)
 		content:SetParent(S.panel.Inset)
 		content:SetAllPoints()
 	else
-		content:SetPoint("TOPLEFT", 12, -70)
-		content:SetPoint("BOTTOMRIGHT", -12, 28)
+		content:SetPoint("TOPLEFT", 12, -32)
+		content:SetPoint("BOTTOMRIGHT", -12, 8)
 	end
 
-	-- Settings cog on the S.panel chrome (inside the main border, above the inset).
+	-- Settings cog on the panel chrome (left of the stock close button).
 	local gear = CreateFrame("Button", "AJHSettingsButton", S.panel)
-	gear:SetSize(16, 16)
-	gear:SetPoint("TOPRIGHT", S.panel, "TOPRIGHT", -14, -38)
-	gear:SetFrameLevel(S.panel:GetFrameLevel() + 10)
+	gear:SetSize(18, 18)
+	local nsLevel = S.panel.NineSlice and S.panel.NineSlice.GetFrameLevel and S.panel.NineSlice:GetFrameLevel() or 0
+	local titleLevel = S.panel.TitleContainer and S.panel.TitleContainer.GetFrameLevel and S.panel.TitleContainer:GetFrameLevel() or 0
+	gear:SetFrameLevel(math.max(S.panel:GetFrameLevel(), nsLevel, titleLevel) + 20)
+	if S.panel.CloseButton then
+		gear:SetPoint("RIGHT", S.panel.CloseButton, "LEFT", -6, 0)
+	else
+		gear:SetPoint("TOPRIGHT", S.panel, "TOPRIGHT", -28, -4)
+	end
 	local gearIcon = gear:CreateTexture(nil, "ARTWORK")
 	gearIcon:SetTexture("Interface\\Buttons\\UI-OptionsButton")
 	gearIcon:SetSize(16, 16)
 	gearIcon:SetPoint("CENTER")
 	gearIcon:SetVertexColor(0.9, 0.9, 0.9)
 	gear.icon = gearIcon
+	gear:EnableMouse(true)
+	gear:Show()
 	gear:SetScript("OnClick", function()
 		ns.SetTab("settings")
 	end)
@@ -1871,6 +2865,14 @@ function ns.BuildPanel()
 	ui.settingsButton = gear
 	ui.tabs.settings = gear
 	ns.UpdateSettingsButton()
+
+	-- Ensure stock close stays above chrome / gear (release left this button alone).
+	if S.panel.CloseButton then
+		local cb = S.panel.CloseButton
+		cb:SetFrameLevel(gear:GetFrameLevel() + 5)
+		cb:EnableMouse(true)
+		cb:Show()
+	end
 
 	local tabDefs = {
 		{ id = "habit", label = "Habit" },
@@ -1911,9 +2913,10 @@ function ns.BuildPanel()
 	local habitMain = CreateFrame("Frame", nil, habit)
 	habitMain:SetAllPoints()
 	ui.habitMain = habitMain
+	ns.ApplyContentFill(habitMain)
 
 	local levelLabel = habitMain:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	levelLabel:SetPoint("TOP", 0, -8)
+	levelLabel:SetPoint("TOP", habitMain, "TOP", 0, -10)
 	levelLabel:SetText("LEVEL")
 	levelLabel:SetTextColor(1, 0.82, 0)
 
@@ -1921,18 +2924,18 @@ function ns.BuildPanel()
 	ui.level:SetPoint("TOP", levelLabel, "BOTTOM", 0, -2)
 	-- Large gold level number.
 	local levelFont = (STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF")
-	ui.level:SetFont(levelFont, 42, "OUTLINE")
+	ui.level:SetFont(levelFont, 36, "OUTLINE")
 	ui.level:SetTextColor(1, 0.82, 0)
 	if ui.level.SetShadowOffset then
 		ui.level:SetShadowOffset(2, -2)
 		ui.level:SetShadowColor(0, 0, 0, 0.85)
 	end
 
-	-- Habit XP bar (dialog): 1.2.0 design ? tooltip border + gold fill + silver tip.
+	-- Habit XP bar (dialog): 1.2.0 design — tooltip border + gold fill + silver tip.
 	local BAR_PAD = 22
 	local barWrap = CreateFrame("Frame", nil, habitMain)
 	barWrap:ClearAllPoints()
-	barWrap:SetPoint("TOP", ui.level, "BOTTOM", 0, -14)
+	barWrap:SetPoint("TOP", ui.level, "BOTTOM", 0, -10)
 	barWrap:SetPoint("LEFT", habitMain, "LEFT", BAR_PAD, 0)
 	barWrap:SetPoint("RIGHT", habitMain, "RIGHT", -BAR_PAD, 0)
 	barWrap:SetHeight(HABIT_PANEL_XP_BAR_HEIGHT)
@@ -2049,39 +3052,22 @@ function ns.BuildPanel()
 	ui.xpDetail:SetPoint("TOP", barWrap, "BOTTOM", 0, -10)
 	ui.xpDetail:SetTextColor(1, 0.82, 0)
 
-	local statsLine = habitMain:CreateTexture(nil, "ARTWORK")
-	statsLine:SetHeight(1)
-	statsLine:SetColorTexture(0.55, 0.45, 0.15, 0.55)
-	statsLine:SetPoint("LEFT", habitMain, "LEFT", 16, 0)
-	statsLine:SetPoint("RIGHT", habitMain, "RIGHT", -16, 0)
-	statsLine:SetPoint("TOP", ui.xpDetail, "BOTTOM", 0, -12)
+	local summaryHeader = ns.CreateSectionHeader(habitMain, "Summary")
+	summaryHeader:SetPoint("LEFT", habitMain, "LEFT", SECTION_INSET, 0)
+	summaryHeader:SetPoint("RIGHT", habitMain, "RIGHT", -SECTION_INSET, 0)
+	summaryHeader:SetPoint("TOP", ui.xpDetail, "BOTTOM", 0, -10)
 
-	local function HabitStatRow(parent, anchor, yOff)
-		local label = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-		label:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, yOff)
-		local value = parent:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-		value:SetPoint("TOPRIGHT", anchor, "BOTTOMRIGHT", 0, yOff)
-		return label, value
-	end
+	local jumpRow = ns.CreateModernStatRow(habitMain, summaryHeader, SECTION_BELOW, "Total jumps", 1)
+	ui.jumpLabel, ui.jumpValue = jumpRow.label, jumpRow.value
 
-	ui.jumpLabel, ui.jumpValue = HabitStatRow(habitMain, statsLine, -14)
-	ui.jumpLabel:SetText("Total jumps")
+	local xpRow = ns.CreateModernStatRow(habitMain, jumpRow, 0, "Experience", 2)
+	ui.xpLabel, ui.xpValue = xpRow.label, xpRow.value
 
-	ui.xpLabel, ui.xpValue = HabitStatRow(habitMain, ui.jumpLabel, -10)
-	ui.xpLabel:SetText("Experience")
-	-- Keep value aligned to the full-width line, not the shorter label.
-	ui.xpValue:ClearAllPoints()
-	ui.xpValue:SetPoint("TOPRIGHT", ui.jumpValue, "BOTTOMRIGHT", 0, -10)
+	local nextRow = ns.CreateModernStatRow(habitMain, xpRow, 0, "XP to next level", 3)
+	ui.nextLabel, ui.nextValue = nextRow.label, nextRow.value
 
-	ui.nextLabel, ui.nextValue = HabitStatRow(habitMain, ui.xpLabel, -10)
-	ui.nextLabel:SetText("XP to next level")
-	ui.nextValue:ClearAllPoints()
-	ui.nextValue:SetPoint("TOPRIGHT", ui.xpValue, "BOTTOMRIGHT", 0, -10)
-
-	ui.rateLabel, ui.rateValue = HabitStatRow(habitMain, ui.nextLabel, -10)
-	ui.rateLabel:SetText("XP per jump")
-	ui.rateValue:ClearAllPoints()
-	ui.rateValue:SetPoint("TOPRIGHT", ui.nextValue, "BOTTOMRIGHT", 0, -10)
+	local rateRow = ns.CreateModernStatRow(habitMain, nextRow, 0, "XP per jump", 4)
+	ui.rateLabel, ui.rateValue = rateRow.label, rateRow.value
 	ui.rateValue:SetText(tostring(XP_PER_JUMP))
 
 	-- Single Announce button (channel picked in a dialog).
@@ -2100,13 +3086,10 @@ function ns.BuildPanel()
 	statsPage:Hide()
 	ui.pages.stats = statsPage
 
-	local statsMain = CreateFrame("Frame", nil, statsPage)
-	statsMain:SetAllPoints()
-	ui.statsMain = statsMain
-
-	local levelsBtn = CreateFrame("Button", nil, statsMain, "UIPanelButtonTemplate")
+	-- Levels button lives on the page chrome (not inside the scroll child).
+	local levelsBtn = CreateFrame("Button", nil, statsPage, "UIPanelButtonTemplate")
 	levelsBtn:SetSize(72, 20)
-	levelsBtn:SetPoint("TOPRIGHT", -6, -6)
+	levelsBtn:SetPoint("BOTTOMRIGHT", -8, 8)
 	levelsBtn:SetText("Levels")
 	levelsBtn:SetScript("OnClick", function()
 		ns.ShowStatsView("levels")
@@ -2114,53 +3097,84 @@ function ns.BuildPanel()
 			S.panel:Update()
 		end
 	end)
+	ui.levelsButton = levelsBtn
 
-	local statsTitle = statsMain:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	statsTitle:SetPoint("TOP", 0, -8)
-	statsTitle:SetText("Statistics")
-	statsTitle:SetTextColor(1, 0.82, 0)
+	local statsWrap, statsScroll, statsMain = ns.CreateScrollArea(statsPage, { overlayBar = false })
+	statsWrap:ClearAllPoints()
+	statsWrap:SetPoint("TOPLEFT", 0, 0)
+	statsWrap:SetPoint("BOTTOMRIGHT", 0, 32)
+	ui.statsWrap = statsWrap
+	ui.statsMain = statsMain
+	ui.statsScroll = statsScroll
+	ns.ApplyContentFill(statsMain)
 
-	local statsDivider = statsMain:CreateTexture(nil, "ARTWORK")
-	statsDivider:SetHeight(1)
-	statsDivider:SetColorTexture(0.55, 0.45, 0.15, 0.55)
-	statsDivider:SetPoint("LEFT", statsMain, "LEFT", 16, 0)
-	statsDivider:SetPoint("RIGHT", statsMain, "RIGHT", -16, 0)
-	statsDivider:SetPoint("TOP", statsTitle, "BOTTOM", 0, -10)
+	local sessionHeader = ns.CreateSectionHeader(statsMain, "This Session")
+	sessionHeader:SetPoint("TOPLEFT", statsMain, "TOPLEFT", SECTION_INSET, SECTION_TOP)
+	sessionHeader:SetPoint("TOPRIGHT", statsMain, "TOPRIGHT", -SECTION_INSET, SECTION_TOP)
 
-	local prevStatValue = nil
-	local function StatsRow(anchor, yOff, labelText)
-		local label, value = HabitStatRow(statsMain, anchor, yOff)
-		label:SetText(labelText)
-		value:ClearAllPoints()
-		if prevStatValue then
-			value:SetPoint("TOPRIGHT", prevStatValue, "BOTTOMRIGHT", 0, yOff)
-		else
-			value:SetPoint("TOPRIGHT", anchor, "BOTTOMRIGHT", 0, yOff)
-		end
-		prevStatValue = value
-		return label, value
+	local stripe = 0
+	local function StatsModernRow(anchor, yOff, labelText)
+		stripe = stripe + 1
+		local row = ns.CreateModernStatRow(statsMain, anchor, yOff, labelText, stripe)
+		return row.label, row.value, row
 	end
 
-	ui.statSessionJumpsLabel, ui.statSessionJumps = StatsRow(statsDivider, -14, "Session jumps")
-	ui.statSessionHighLabel, ui.statSessionHigh = StatsRow(ui.statSessionJumpsLabel, -10, "Best session")
-	ui.statSessionTimeLabel, ui.statSessionTime = StatsRow(ui.statSessionHighLabel, -10, "Session time")
-	ui.statSessionActivityLabel, ui.statSessionActivity = StatsRow(ui.statSessionTimeLabel, -10, "Session activity")
-	ui.statSessionRateLabel, ui.statSessionRate = StatsRow(ui.statSessionActivityLabel, -10, "Session rate")
-	ui.statRecentRateLabel, ui.statRecentRate = StatsRow(ui.statSessionRateLabel, -10, "Recent rate (5m)")
-	ui.statLifeJumpsLabel, ui.statLifeJumps = StatsRow(ui.statRecentRateLabel, -10, "Lifetime jumps")
-	ui.statLifeLevelLabel, ui.statLifeLevel = StatsRow(ui.statLifeJumpsLabel, -10, "Lifetime level")
-	ui.statLifeActivityLabel, ui.statLifeActivity = StatsRow(ui.statLifeLevelLabel, -10, "Lifetime activity")
-	ui.statFeatsLabel, ui.statFeats = StatsRow(ui.statLifeActivityLabel, -10, "Feats unlocked")
-	ui.statLastJumpLabel, ui.statLastJump = StatsRow(ui.statFeatsLabel, -10, "Time since last jump")
+	local r
+	ui.statSessionJumpsLabel, ui.statSessionJumps, r = StatsModernRow(sessionHeader, SECTION_BELOW, "Session jumps")
+	ui.statSessionHighLabel, ui.statSessionHigh, r = StatsModernRow(r, 0, "Best session")
+	ui.statSessionTimeLabel, ui.statSessionTime, r = StatsModernRow(r, 0, "Session time")
+	ui.statSessionActivityLabel, ui.statSessionActivity, r = StatsModernRow(r, 0, "Session activity")
+	ui.statSessionRateLabel, ui.statSessionRate, r = StatsModernRow(r, 0, "Session rate")
+	ui.statRecentRateLabel, ui.statRecentRate, r = StatsModernRow(r, 0, "Recent rate (5m)")
+
+	local lifeHeader = ns.CreateSectionHeader(statsMain, "Lifetime")
+	lifeHeader:SetPoint("LEFT", statsMain, "LEFT", SECTION_INSET, 0)
+	lifeHeader:SetPoint("RIGHT", statsMain, "RIGHT", -SECTION_INSET, 0)
+	lifeHeader:SetPoint("TOP", r, "BOTTOM", 0, -8)
+
+	stripe = 0
+	ui.statLifeJumpsLabel, ui.statLifeJumps, r = StatsModernRow(lifeHeader, SECTION_BELOW, "Lifetime jumps")
+	ui.statLifeLevelLabel, ui.statLifeLevel, r = StatsModernRow(r, 0, "Lifetime level")
+	ui.statLifeActivityLabel, ui.statLifeActivity, r = StatsModernRow(r, 0, "Lifetime activity")
+	ui.statFeatsLabel, ui.statFeats, r = StatsModernRow(r, 0, "Feats unlocked")
+	ui.statLastJumpLabel, ui.statLastJump, r = StatsModernRow(r, 0, "Time since last jump")
+
+	local function LayoutStatsScroll()
+		local scroll = ui.statsScroll
+		local child = ui.statsMain
+		if not scroll or not child or not r then
+			return
+		end
+		local w = scroll:GetWidth() or 0
+		if w > 0 then
+			child:SetWidth(w)
+		end
+		-- Approximate content height from session header through last row.
+		local top = sessionHeader:GetTop()
+		local bottom = r:GetBottom()
+		local parentTop = child:GetTop()
+		if top and bottom and parentTop then
+			child:SetHeight(math.max(1, (parentTop - bottom) + 16))
+		else
+			child:SetHeight(360)
+		end
+		if scroll.UpdateScrollChildRect then
+			scroll:UpdateScrollChildRect()
+		end
+	end
+	ui.LayoutStatsScroll = LayoutStatsScroll
+	statsMain:HookScript("OnShow", LayoutStatsScroll)
+	statsScroll:HookScript("OnSizeChanged", LayoutStatsScroll)
 
 	local levels = CreateFrame("Frame", nil, statsPage)
 	levels:SetAllPoints()
 	levels:Hide()
 	ui.statsLevels = levels
+	ns.ApplyContentFill(levels)
 
 	local levelsBack = CreateFrame("Button", nil, levels, "UIPanelButtonTemplate")
 	levelsBack:SetSize(60, 20)
-	levelsBack:SetPoint("TOPLEFT", 6, -6)
+	levelsBack:SetPoint("BOTTOMRIGHT", -8, 8)
 	levelsBack:SetText("Back")
 	levelsBack:SetScript("OnClick", function()
 		ns.ShowStatsView("main")
@@ -2168,19 +3182,42 @@ function ns.BuildPanel()
 			S.panel:Update()
 		end
 	end)
+	ui.levelsBack = levelsBack
 
-	local levelsTitle = levels:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	levelsTitle:SetPoint("TOP", 0, -8)
-	levelsTitle:SetText("Levels")
-	levelsTitle:SetTextColor(1, 0.82, 0)
-
-	local levelsWrap, levelScroll, levelChild = ns.CreateScrollArea(levels)
+	-- Same scroll chrome as Stats: section header lives inside the child.
+	local levelsWrap, levelScroll, levelChild = ns.CreateScrollArea(levels, { overlayBar = false })
 	levelsWrap:ClearAllPoints()
-	levelsWrap:SetPoint("TOPLEFT", 4, -32)
-	levelsWrap:SetPoint("BOTTOMRIGHT", -4, 4)
+	levelsWrap:SetPoint("TOPLEFT", 0, 0)
+	levelsWrap:SetPoint("BOTTOMRIGHT", 0, 32)
+	ui.levelWrap = levelsWrap
 	ui.levelScroll = levelScroll
 	ui.levelChild = levelChild
+	ns.ApplyContentFill(levelChild)
 	ns.BuildLevelRows(levelChild)
+
+	local function LayoutLevelsScroll()
+		if not (levelScroll and levelChild) then
+			return
+		end
+		local w = levelScroll:GetWidth() or 0
+		if w > 0 then
+			levelChild:SetWidth(w)
+		end
+		if ui.levelsSectionHeader then
+			ui.levelsSectionHeader:ClearAllPoints()
+			ui.levelsSectionHeader:SetPoint("TOPLEFT", SECTION_INSET, SECTION_TOP)
+			ui.levelsSectionHeader:SetPoint("TOPRIGHT", -SECTION_INSET, SECTION_TOP)
+		end
+		if ui.levelColHeader then
+			LayoutLevelColumns(ui.levelColHeader)
+		end
+		for _, row in pairs(ui.levelRows) do
+			LayoutLevelColumns(row)
+		end
+	end
+	ui.LayoutLevelsScroll = LayoutLevelsScroll
+	levels:HookScript("OnShow", LayoutLevelsScroll)
+	levelScroll:HookScript("OnSizeChanged", LayoutLevelsScroll)
 
 	ns.ShowStatsView("main")
 
@@ -2189,10 +3226,11 @@ function ns.BuildPanel()
 	achieves:SetAllPoints()
 	achieves:Hide()
 	ui.pages.achieves = achieves
+	ns.ApplyContentFill(achieves)
 
 	ui.featBack = CreateFrame("Button", nil, achieves, "UIPanelButtonTemplate")
 	ui.featBack:SetSize(56, 20)
-	ui.featBack:SetPoint("TOPLEFT", 8, -12)
+	ui.featBack:SetPoint("BOTTOMRIGHT", -8, 8)
 	ui.featBack:SetText("Back")
 	ui.featBack:Hide()
 	ui.featBack:SetScript("OnClick", function()
@@ -2201,34 +3239,166 @@ function ns.BuildPanel()
 		ns.UpdateAchievements()
 	end)
 
-	-- Flat gold diamond (rotated square): SVG-style, not a painted icon.
-	ui.achSummaryIcon = CreateFrame("Frame", nil, achieves)
-	ui.achSummaryIcon:SetSize(14, 14)
-	ui.achSummaryIcon:SetPoint("TOPLEFT", 12, -14)
-	local diamond = ui.achSummaryIcon:CreateTexture(nil, "ARTWORK")
-	diamond:SetTexture("Interface\\Buttons\\WHITE8X8")
-	diamond:SetSize(9, 9)
-	diamond:SetPoint("CENTER", 0, 0)
-	diamond:SetVertexColor(1, 0.82, 0, 1)
-	if diamond.SetRotation then
-		diamond:SetRotation(math.rad(45))
-	end
-	ui.achSummaryIcon.tex = diamond
+	-- Category detail: section header below a progress bar + frog cluster.
+	ui.featDetailHeader = ns.CreateSectionHeader(achieves, "Feats")
+	ui.featDetailHeader:Hide()
 
-	ui.achSummary = achieves:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	ui.achSummary:SetPoint("LEFT", ui.achSummaryIcon, "RIGHT", 6, 0)
+	local FROG_SIZE = 28
+	local DETAIL_BAR_W = 240
+	local DETAIL_BAR_H = FEAT_CAT_BAR_H
+	ui.achSummaryCluster = CreateFrame("Frame", nil, achieves)
+	ui.achSummaryCluster:SetHeight(FROG_SIZE)
+	ui.achSummaryCluster:SetFrameLevel(achieves:GetFrameLevel() + 5)
+	ui.achSummaryCluster:SetPoint("TOP", 0, SECTION_TOP)
+
+	ui.achSummaryIcon = CreateFrame("Frame", nil, ui.achSummaryCluster)
+	ui.achSummaryIcon:SetSize(FROG_SIZE, FROG_SIZE)
+	ui.achSummaryIcon:SetPoint("RIGHT", ui.achSummaryCluster, "RIGHT", 0, 0)
+	local frog = ui.achSummaryIcon:CreateTexture(nil, "ARTWORK")
+	frog:SetAllPoints()
+	frog:SetTexture("Interface\\AddOns\\AJH\\AJH-gold-frog")
+	if frog.SetTexCoord then
+		frog:SetTexCoord(0.06, 0.94, 0.06, 0.94)
+	end
+	if frog.SetBlendMode then
+		frog:SetBlendMode("BLEND")
+	end
+	ui.achSummaryIcon.tex = frog
+
+	-- Progress bar + frog (overview total and category detail share this chrome).
+	ui.achSummary = ui.achSummaryCluster:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	ui.achSummary:Hide()
 	ui.achSummary:SetTextColor(1, 0.82, 0)
 
-	local achWrap, _, achChild = ns.CreateScrollArea(achieves)
+	ui.featDetailBarWrap = CreateFrame("Frame", nil, ui.achSummaryCluster)
+	ui.featDetailBarWrap:SetSize(DETAIL_BAR_W, DETAIL_BAR_H)
+	ui.featDetailBarWrap:SetPoint("RIGHT", ui.achSummaryIcon, "LEFT", -6, 0)
+	ui.featDetailBarWrap:SetFrameLevel(ui.achSummaryCluster:GetFrameLevel() + 1)
+	ui.featDetailBarWrap:Hide()
+
+	local detailBarBorder = CreateFrame("Frame", nil, ui.featDetailBarWrap, BackdropTemplateMixin and "BackdropTemplate" or nil)
+	detailBarBorder:SetPoint("TOPLEFT", 0, 0)
+	detailBarBorder:SetPoint("BOTTOMRIGHT", 0, 0)
+	detailBarBorder:SetFrameLevel(ui.featDetailBarWrap:GetFrameLevel() + 3)
+	if detailBarBorder.SetBackdrop then
+		detailBarBorder:SetBackdrop({
+			edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+			edgeSize = 12,
+			insets = { left = 3, right = 3, top = 3, bottom = 3 },
+		})
+		detailBarBorder:SetBackdropBorderColor(0.45, 0.45, 0.45, 1)
+	end
+
+	ui.featDetailBar = CreateFrame("StatusBar", nil, ui.featDetailBarWrap)
+	ui.featDetailBar:SetPoint("TOPLEFT", ui.featDetailBarWrap, "TOPLEFT", 3, -3)
+	ui.featDetailBar:SetPoint("BOTTOMRIGHT", ui.featDetailBarWrap, "BOTTOMRIGHT", -3, 3)
+	ui.featDetailBar:SetMinMaxValues(0, 1)
+	ui.featDetailBar:SetValue(0)
+	ui.featDetailBar:SetFrameLevel(ui.featDetailBarWrap:GetFrameLevel() + 1)
+	ui.featDetailBar:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
+	ui.featDetailBar:SetStatusBarColor(1.0, 0.82, 0.0, 1)
+	do
+		local fillTex = ui.featDetailBar:GetStatusBarTexture()
+		if fillTex then
+			fillTex:SetHorizTile(false)
+			fillTex:SetVertTile(false)
+		end
+	end
+	local detailTrack = ui.featDetailBar:CreateTexture(nil, "BACKGROUND")
+	detailTrack:SetAllPoints()
+	detailTrack:SetColorTexture(0.08, 0.07, 0.04, 1)
+
+	ui.featDetailBarText = detailBarBorder:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	ui.featDetailBarText:SetPoint("CENTER", ui.featDetailBar, "CENTER", 0, 0)
+	ui.featDetailBarText:SetTextColor(1, 1, 1, 1)
+	do
+		local fontPath, fontSize = ui.featDetailBarText:GetFont()
+		if fontPath then
+			ui.featDetailBarText:SetFont(fontPath, fontSize or 11, "OUTLINE")
+		end
+	end
+	if ui.featDetailBarText.SetShadowOffset then
+		ui.featDetailBarText:SetShadowOffset(0, 0)
+		ui.featDetailBarText:SetShadowColor(0, 0, 0, 0)
+	end
+
+	ui.featDetailBarWrap:SetScript("OnEnter", function(self)
+		local earned = self._earned or 0
+		local total = self._total or 0
+		GameTooltip:SetOwner(self, "ANCHOR_TOP")
+		GameTooltip:SetText(string.format("%d / %d complete", earned, total), 1, 0.82, 0)
+		GameTooltip:Show()
+	end)
+	ui.featDetailBarWrap:SetScript("OnLeave", function()
+		GameTooltip:Hide()
+	end)
+	ui.featDetailBarWrap:EnableMouse(true)
+
+	ui.LayoutFeatSummaryCluster = function()
+		local cluster = ui.achSummaryCluster
+		local text = ui.achSummary
+		local icon = ui.achSummaryIcon
+		local barWrap = ui.featDetailBarWrap
+		if not (cluster and icon and barWrap) then
+			return
+		end
+		-- Same bar + frog on both category overview and detail (count lives in the bar).
+		if text then
+			text:Hide()
+		end
+		icon:ClearAllPoints()
+		icon:SetPoint("RIGHT", cluster, "RIGHT", 0, 0)
+		barWrap:Show()
+		barWrap:ClearAllPoints()
+		barWrap:SetPoint("RIGHT", icon, "LEFT", -6, 0)
+		cluster:SetHeight(math.max(FROG_SIZE, DETAIL_BAR_H))
+		cluster:SetWidth(DETAIL_BAR_W + 6 + FROG_SIZE)
+	end
+
+	local achWrap, achScroll, achChild = ns.CreateScrollArea(achieves, { overlayBar = false })
 	achWrap:SetPoint("TOPLEFT", 4, -40)
-	-- Leave room for the reset button only when local DEV_TOOLS is on.
-	achWrap:SetPoint("BOTTOMRIGHT", -4, DEV_TOOLS and 32 or 4)
+	achWrap:SetPoint("BOTTOMRIGHT", -4, 4)
+	ui.achWrap = achWrap
+	ui.achScroll = achScroll
 	ui.achChild = achChild
+
+	ui.LayoutFeatScroll = function(inCategory)
+		if not ui.achWrap then
+			return
+		end
+		local bottom = 4
+		if inCategory then
+			bottom = DEV_TOOLS and 56 or 32
+		elseif DEV_TOOLS then
+			bottom = 32
+		end
+		local top = -40
+		if inCategory and ui.featDetailHeader then
+			local clusterH = (ui.achSummaryCluster and ui.achSummaryCluster:GetHeight()) or 28
+			local headerH = ui.featDetailHeader:GetHeight() or 28
+			-- Cluster at SECTION_TOP, header below it, then scroll.
+			top = SECTION_TOP - clusterH + SECTION_BELOW - headerH + SECTION_BELOW
+		end
+		ui.achWrap:ClearAllPoints()
+		ui.achWrap:SetPoint("TOPLEFT", SECTION_INSET, top)
+		ui.achWrap:SetPoint("TOPRIGHT", -SECTION_INSET, top)
+		ui.achWrap:SetPoint("BOTTOMLEFT", SECTION_INSET, bottom)
+		ui.achWrap:SetPoint("BOTTOMRIGHT", -SECTION_INSET, bottom)
+	end
+	ui.LayoutFeatScroll(false)
+
+	if achScroll then
+		achScroll:HookScript("OnSizeChanged", function()
+			if ui.featView == "categories" or not ui.featView then
+				ns.UpdateAchievements()
+			end
+		end)
+	end
 
 	if DEV_TOOLS then
 		local resetAch = CreateFrame("Button", nil, achieves, "UIPanelButtonTemplate")
 		resetAch:SetPoint("BOTTOMLEFT", 12, 6)
-		resetAch:SetPoint("BOTTOMRIGHT", -12, 6)
+		resetAch:SetPoint("RIGHT", ui.featBack, "LEFT", -8, 0)
 		resetAch:SetHeight(22)
 		resetAch:SetText("Reset feats (testing)")
 		resetAch:SetScript("OnClick", function()
@@ -2236,39 +3406,24 @@ function ns.BuildPanel()
 		end)
 	end
 
-	-- Guild page
+	-- Guild page (Leaderboard — same chrome language as Stats / Habit)
 	local guild = CreateFrame("Frame", nil, content)
 	guild:SetAllPoints()
 	guild:Hide()
 	ui.pages.guild = guild
+	ns.ApplyContentFill(guild)
 
-	local boardWrap, _, boardChild = ns.CreateScrollArea(guild)
-	ui.boardChild = boardChild
+	local boardHeader = ns.CreateSectionHeader(guild, "Leaderboard")
+	boardHeader:SetPoint("TOPLEFT", SECTION_INSET, SECTION_TOP)
+	boardHeader:SetPoint("TOPRIGHT", -SECTION_INSET, SECTION_TOP)
+	ui.guildSectionHeader = boardHeader
 
-	local boardHeaderRank = boardChild:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	boardHeaderRank:SetPoint("TOPLEFT", 8, -4)
-	boardHeaderRank:SetText("#")
-
-	local boardHeaderName = boardChild:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	boardHeaderName:SetPoint("TOPLEFT", 40, -4)
-	boardHeaderName:SetText("NAME")
-
-	local boardHeaderLevel = boardChild:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	boardHeaderLevel:SetPoint("TOPRIGHT", -112, -4)
-	boardHeaderLevel:SetText("LVL")
-
-	local boardHeaderJumps = boardChild:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	boardHeaderJumps:SetPoint("TOPRIGHT", -52, -4)
-	boardHeaderJumps:SetText("JUMPS")
-
-	local boardHeaderAchs = boardChild:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	boardHeaderAchs:SetPoint("TOPRIGHT", -8, -4)
-	boardHeaderAchs:SetText("FEATS")
-
-	ui.guildEmpty = guild:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	ui.guildEmpty:SetPoint("CENTER", boardWrap, "CENTER", -8, 0)
-	ui.guildEmpty:SetWidth(280)
-	ui.guildEmpty:SetJustifyH("CENTER")
+	ui.guildHint = guild:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	ui.guildHint:SetPoint("TOPLEFT", boardHeader, "BOTTOMLEFT", 2, -4)
+	ui.guildHint:SetPoint("TOPRIGHT", boardHeader, "BOTTOMRIGHT", -2, -4)
+	ui.guildHint:SetJustifyH("CENTER")
+	ui.guildHint:SetTextColor(0.75, 0.72, 0.65, 1)
+	ui.guildHint:Hide()
 
 	local refresh = CreateFrame("Button", nil, guild, "UIPanelButtonTemplate")
 	refresh:SetPoint("BOTTOMLEFT", 12, 6)
@@ -2279,64 +3434,159 @@ function ns.BuildPanel()
 		ns.RequestGuildScores()
 		ns.UpdateLeaderboard()
 	end)
+	ui.guildRefresh = refresh
 
-	boardWrap:SetPoint("TOPLEFT", 4, -4)
-	boardWrap:SetPoint("BOTTOMRIGHT", -4, 32)
+	local boardWrap, boardScroll, boardChild = ns.CreateScrollArea(guild, { overlayBar = false })
+	boardWrap:ClearAllPoints()
+	boardWrap:SetPoint("TOPLEFT", boardHeader, "BOTTOMLEFT", 0, SECTION_BELOW)
+	boardWrap:SetPoint("TOPRIGHT", boardHeader, "BOTTOMRIGHT", 0, SECTION_BELOW)
+	boardWrap:SetPoint("BOTTOMLEFT", refresh, "TOPLEFT", 0, 6)
+	boardWrap:SetPoint("BOTTOMRIGHT", refresh, "TOPRIGHT", 0, 6)
+	ui.boardWrap = boardWrap
+	ui.boardScroll = boardScroll
+	ui.boardChild = boardChild
+	ns.ApplyContentFill(boardChild)
 
-	-- Settings page (sound enable + volume)
+	-- Column header row (same columns as data rows).
+	local colHeader = CreateFrame("Frame", nil, boardChild)
+	colHeader:SetHeight(COL_HEADER_H)
+	colHeader:SetPoint("TOPLEFT", 0, 0)
+	colHeader:SetPoint("TOPRIGHT", 0, 0)
+	colHeader.bg = colHeader:CreateTexture(nil, "BACKGROUND")
+	colHeader.bg:SetAllPoints()
+	colHeader.bg:SetColorTexture(0.12, 0.10, 0.07, 0.95)
+	colHeader.rank = colHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	colHeader.rank:SetText("#")
+	colHeader.rank:SetTextColor(1, 0.82, 0)
+	colHeader.name = colHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	colHeader.name:SetText("Name")
+	colHeader.name:SetTextColor(1, 0.82, 0)
+	colHeader.level = colHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	colHeader.level:SetText("Lvl")
+	colHeader.level:SetTextColor(1, 0.82, 0)
+	colHeader.jumps = colHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	colHeader.jumps:SetText("Jumps")
+	colHeader.jumps:SetTextColor(1, 0.82, 0)
+	colHeader.achs = colHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	colHeader.achs:SetText("Feats")
+	colHeader.achs:SetTextColor(1, 0.82, 0)
+	LayoutBoardColumns(colHeader)
+	ui.boardColHeader = colHeader
+
+	-- Keep scroll top under header/hint.
+	local function LayoutGuildScroll()
+		if not boardWrap or not boardHeader then
+			return
+		end
+		boardWrap:ClearAllPoints()
+		local topAnchor = boardHeader
+		local topOff = SECTION_BELOW
+		if ui.guildHint and ui.guildHint:IsShown() then
+			topAnchor = ui.guildHint
+			topOff = SECTION_BELOW
+		end
+		boardWrap:SetPoint("TOPLEFT", topAnchor, "BOTTOMLEFT", 0, topOff)
+		boardWrap:SetPoint("TOPRIGHT", topAnchor, "BOTTOMRIGHT", 0, topOff)
+		boardWrap:SetPoint("BOTTOMLEFT", refresh, "TOPLEFT", 0, 6)
+		boardWrap:SetPoint("BOTTOMRIGHT", refresh, "TOPRIGHT", 0, 6)
+		if boardScroll then
+			local w = boardScroll:GetWidth() or 0
+			if w > 0 and boardChild then
+				boardChild:SetWidth(w)
+			end
+		end
+		LayoutBoardColumns(colHeader)
+	end
+	ui.LayoutGuildScroll = LayoutGuildScroll
+	guild:HookScript("OnShow", function()
+		LayoutGuildScroll()
+		ns.UpdateLeaderboard()
+	end)
+	if boardScroll then
+		boardScroll:HookScript("OnSizeChanged", LayoutGuildScroll)
+	end
+
+	-- Settings page — section chrome like Habit / Stats / Guild.
 	local settings = CreateFrame("Frame", nil, content)
 	settings:SetAllPoints()
 	settings:Hide()
 	ui.pages.settings = settings
+	ns.ApplyContentFill(settings)
 
-	local settingsTitle = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	settingsTitle:SetPoint("TOP", 0, -12)
-	settingsTitle:SetText("Settings")
-	settingsTitle:SetTextColor(1, 0.82, 0)
+	local generalHeader = ns.CreateSectionHeader(settings, "General")
+	generalHeader:SetPoint("TOPLEFT", SECTION_INSET, SECTION_TOP)
+	generalHeader:SetPoint("TOPRIGHT", -SECTION_INSET, SECTION_TOP)
 
-	local soundCheck = CreateFrame("CheckButton", nil, settings, "UICheckButtonTemplate")
-	soundCheck:SetPoint("TOPLEFT", 20, -48)
-	soundCheck:SetSize(26, 26)
-	local soundCheckLabel = settings:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	soundCheckLabel:SetPoint("LEFT", soundCheck, "RIGHT", 4, 1)
-	soundCheckLabel:SetText("Enable sounds")
-	soundCheck:SetScript("OnClick", function(self)
-		ns.EnsureDB()
-		ns.DB().soundsEnabled = not not self:GetChecked()
-	end)
-	ui.soundCheck = soundCheck
+	local function MakeSettingsCheck(anchor, yOff, labelText)
+		local check = CreateFrame("CheckButton", nil, settings, "UICheckButtonTemplate")
+		check:SetSize(24, 24)
+		check:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, yOff)
+		local label = settings:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		label:SetPoint("LEFT", check, "RIGHT", 6, 1)
+		label:SetText(labelText)
+		label:SetTextColor(0.95, 0.95, 0.92)
+		-- Clicking the label toggles the checkbox.
+		local hit = CreateFrame("Button", nil, settings)
+		hit:SetPoint("LEFT", label, "LEFT", 0, 0)
+		hit:SetPoint("RIGHT", label, "RIGHT", 0, 0)
+		hit:SetHeight(24)
+		hit:SetScript("OnClick", function()
+			check:Click()
+		end)
+		return check, label
+	end
 
-	local announceCheck = CreateFrame("CheckButton", nil, settings, "UICheckButtonTemplate")
-	announceCheck:SetPoint("TOPLEFT", soundCheck, "BOTTOMLEFT", 0, -6)
-	announceCheck:SetSize(26, 26)
-	local announceCheckLabel = settings:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	announceCheckLabel:SetPoint("LEFT", announceCheck, "RIGHT", 4, 1)
-	announceCheckLabel:SetText("Auto announce feats to guild")
+	local announceCheck = MakeSettingsCheck(generalHeader, SECTION_BELOW - 2, "Auto announce feats to guild")
 	announceCheck:SetScript("OnClick", function(self)
 		ns.EnsureDB()
 		ns.DB().autoAnnounce = not not self:GetChecked()
 	end)
 	ui.announceCheck = announceCheck
 
-	local xpBarCheck = CreateFrame("CheckButton", nil, settings, "UICheckButtonTemplate")
-	xpBarCheck:SetPoint("TOPLEFT", announceCheck, "BOTTOMLEFT", 0, -6)
-	xpBarCheck:SetSize(26, 26)
-	local xpBarCheckLabel = settings:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	xpBarCheckLabel:SetPoint("LEFT", xpBarCheck, "RIGHT", 4, 1)
-	xpBarCheckLabel:SetText("Show Jump XP bar")
+	local xpBarCheck = MakeSettingsCheck(announceCheck, -4, "Show Jump XP bar")
 	xpBarCheck:SetScript("OnClick", function(self)
 		ns.EnsureDB()
 		ns.SetJumpXPBarShown(not not self:GetChecked())
 	end)
 	ui.jumpXPBarCheck = xpBarCheck
 
+	local minimapCheck = MakeSettingsCheck(xpBarCheck, -4, "Show minimap button")
+	minimapCheck:SetScript("OnClick", function(self)
+		ns.EnsureDB()
+		ns.SetMinimapButtonShown(not not self:GetChecked())
+	end)
+	ui.minimapCheck = minimapCheck
+
+	local toastCheck = MakeSettingsCheck(minimapCheck, -4, "Show feat unlock toasts")
+	toastCheck:SetScript("OnClick", function(self)
+		ns.EnsureDB()
+		ns.DB().showFeatToasts = not not self:GetChecked()
+	end)
+	ui.toastCheck = toastCheck
+
+	local audioHeader = ns.CreateSectionHeader(settings, "Audio")
+	audioHeader:ClearAllPoints()
+	audioHeader:SetPoint("LEFT", settings, "LEFT", SECTION_INSET, 0)
+	audioHeader:SetPoint("RIGHT", settings, "RIGHT", -SECTION_INSET, 0)
+	audioHeader:SetPoint("TOP", toastCheck, "BOTTOM", 0, -14)
+
+	local soundCheck = MakeSettingsCheck(audioHeader, SECTION_BELOW - 2, "Enable sounds")
+	soundCheck:SetScript("OnClick", function(self)
+		ns.EnsureDB()
+		ns.DB().soundsEnabled = not not self:GetChecked()
+	end)
+	ui.soundCheck = soundCheck
+
 	local volumeLabel = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	volumeLabel:SetPoint("TOPLEFT", 24, -156)
+	volumeLabel:SetPoint("TOPLEFT", soundCheck, "BOTTOMLEFT", 2, -12)
 	volumeLabel:SetText("Sound volume")
+	volumeLabel:SetTextColor(1, 0.82, 0)
 	ui.soundVolumeLabel = volumeLabel
 
 	local volumeValue = settings:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	volumeValue:SetPoint("LEFT", volumeLabel, "RIGHT", 8, 0)
+	volumeValue:SetPoint("TOP", volumeLabel, "TOP", 0, 0)
+	volumeValue:SetPoint("RIGHT", settings, "RIGHT", -SECTION_INSET, 0)
+	volumeValue:SetJustifyH("RIGHT")
 	ui.soundVolumeValue = volumeValue
 
 	local volumeSlider
@@ -2356,13 +3606,37 @@ function ns.BuildPanel()
 		bg:SetPoint("TOPLEFT", 0, 0)
 		bg:SetPoint("BOTTOMRIGHT", 0, 0)
 	end
-	volumeSlider:SetPoint("TOPLEFT", 28, -188)
-	volumeSlider:SetPoint("TOPRIGHT", -28, -188)
+	volumeSlider:ClearAllPoints()
+	volumeSlider:SetPoint("TOPLEFT", volumeLabel, "BOTTOMLEFT", 0, -10)
+	volumeSlider:SetPoint("RIGHT", settings, "RIGHT", -SECTION_INSET, 0)
 	volumeSlider:SetHeight(16)
 	volumeSlider:SetMinMaxValues(0, 100)
 	volumeSlider:SetValueStep(1)
 	if volumeSlider.SetObeyStepOnDrag then
 		volumeSlider:SetObeyStepOnDrag(true)
+	end
+	-- OptionsSliderTemplate draws its own title on the track — hide it (was overlapping).
+	do
+		local name = volumeSlider:GetName()
+		local low = name and _G[name .. "Low"]
+		local high = name and _G[name .. "High"]
+		local text = name and _G[name .. "Text"]
+		if low then
+			low:SetText("0")
+			low:ClearAllPoints()
+			low:SetPoint("TOPLEFT", volumeSlider, "BOTTOMLEFT", 0, -2)
+			low:SetTextColor(0.65, 0.65, 0.65)
+		end
+		if high then
+			high:SetText("100")
+			high:ClearAllPoints()
+			high:SetPoint("TOPRIGHT", volumeSlider, "BOTTOMRIGHT", 0, -2)
+			high:SetTextColor(0.65, 0.65, 0.65)
+		end
+		if text then
+			text:SetText("")
+			text:Hide()
+		end
 	end
 	volumeSlider:SetScript("OnValueChanged", function(self, value)
 		ns.EnsureDB()
@@ -2371,33 +3645,8 @@ function ns.BuildPanel()
 		if ui.soundVolumeValue then
 			ui.soundVolumeValue:SetText(tostring(value))
 		end
-		local text = _G[self:GetName() .. "Text"]
-		if text then
-			text:SetText("Sound volume")
-		end
 	end)
-	do
-		local low = _G[volumeSlider:GetName() .. "Low"]
-		local high = _G[volumeSlider:GetName() .. "High"]
-		local text = _G[volumeSlider:GetName() .. "Text"]
-		if low then
-			low:SetText("0")
-		end
-		if high then
-			high:SetText("100")
-		end
-		if text then
-			text:SetText("Sound volume")
-		end
-	end
 	ui.soundVolumeSlider = volumeSlider
-
-	local volumeNote = settings:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	volumeNote:SetPoint("TOPLEFT", 24, -228)
-	volumeNote:SetPoint("TOPRIGHT", -24, -228)
-	volumeNote:SetJustifyH("LEFT")
-	volumeNote:SetText("Volume 0 mutes AJH sounds. Announce via Habit button or /ajh say|party|guild.")
-	volumeNote:SetTextColor(0.7, 0.7, 0.7)
 
 	S.panel:SetScript("OnShow", function()
 		ns.PlayUISound("IG_CHARACTER_INFO_OPEN", 839)
@@ -2517,6 +3766,12 @@ function ns.BuildPanel()
 			if ui.announceCheck then
 				ui.announceCheck:SetChecked(not not ns.DB().autoAnnounce)
 			end
+			if ui.minimapCheck then
+				ui.minimapCheck:SetChecked(ns.DB().showMinimapButton ~= false)
+			end
+			if ui.toastCheck then
+				ui.toastCheck:SetChecked(ns.DB().showFeatToasts ~= false)
+			end
 			ns.UpdateJumpXPBarToggleLabel()
 			local vol = ns.ToNumberOr(ns.DB().soundVolume, 100) or 100
 			ui.soundVolumeSlider:SetValue(vol)
@@ -2534,6 +3789,723 @@ function ns.BuildPanel()
 
 	ns.SetTab("habit", true)
 	return S.panel
+end
+
+local FEAT_TRACKER_LINE_H = 32
+local FEAT_TRACKER_HEADER_H = 25
+local FEAT_TRACKER_GAP = 10
+local FEAT_TRACKER_BELOW_HEADER = 10
+
+local function GetObjectiveTrackerHost()
+	return ObjectiveTrackerFrame or ObjectiveTrackerContainerFrame or WatchFrame
+end
+
+local function IsObjectiveTrackerHostCollapsed()
+	local host = GetObjectiveTrackerHost()
+	if not host then
+		return false
+	end
+	if type(host.IsCollapsed) == "function" then
+		local ok, collapsed = pcall(host.IsCollapsed, host)
+		if ok then
+			return not not collapsed
+		end
+	end
+	if host.isCollapsed ~= nil then
+		return not not host.isCollapsed
+	end
+	if host.collapsed ~= nil then
+		return not not host.collapsed
+	end
+	return false
+end
+
+local function HookObjectiveTrackerCollapse()
+	local host = GetObjectiveTrackerHost()
+	if host and not host._ajhFeatCollapseHooked then
+		host._ajhFeatCollapseHooked = true
+		if type(host.SetCollapsed) == "function" then
+			hooksecurefunc(host, "SetCollapsed", function()
+				if ns.UpdateFeatTracker then
+					ns.UpdateFeatTracker()
+				end
+			end)
+		end
+		if type(host.ToggleCollapsed) == "function" then
+			hooksecurefunc(host, "ToggleCollapsed", function()
+				if ns.UpdateFeatTracker then
+					ns.UpdateFeatTracker()
+				end
+			end)
+		end
+	end
+	if not ns._ajhFeatCollapseGlobalsHooked then
+		ns._ajhFeatCollapseGlobalsHooked = true
+		if type(ObjectiveTracker_Collapse) == "function" then
+			hooksecurefunc("ObjectiveTracker_Collapse", function()
+				if ns.UpdateFeatTracker then
+					ns.UpdateFeatTracker()
+				end
+			end)
+		end
+		if type(ObjectiveTracker_Expand) == "function" then
+			hooksecurefunc("ObjectiveTracker_Expand", function()
+				if ns.UpdateFeatTracker then
+					ns.UpdateFeatTracker()
+				end
+			end)
+		end
+	end
+end
+
+local FEAT_TRACKER_HEADER_TEMPLATES = {
+	"ObjectiveTrackerModuleHeaderTemplate",
+	"ObjectiveTrackerContainerHeaderTemplate",
+	"ObjectiveTrackerHeaderTemplate",
+}
+
+local function FindQuestTrackerHeaderDonor()
+	for _, name in ipairs({
+		"QuestObjectiveTracker",
+		"CampaignQuestObjectiveTracker",
+		"AchievementObjectiveTracker",
+	}) do
+		local module = _G[name]
+		if module and module.Header then
+			return module.Header
+		end
+	end
+	local host = GetObjectiveTrackerHost()
+	if host and host.modules then
+		for _, module in pairs(host.modules) do
+			if module and module.Header then
+				return module.Header
+			end
+		end
+	end
+	return nil
+end
+
+local function CopyTextureLook(dst, src)
+	if not (dst and src) then
+		return false
+	end
+	local atlas = src.GetAtlas and src:GetAtlas()
+	if atlas and atlas ~= "" and dst.SetAtlas then
+		dst:SetAtlas(atlas, true)
+		return true
+	end
+	local tex = src.GetTexture and src:GetTexture()
+	if tex and dst.SetTexture then
+		dst:SetTexture(tex)
+		if src.GetTexCoord then
+			local l, r, t, b = src:GetTexCoord()
+			if l then
+				dst:SetTexCoord(l, r, t, b)
+			end
+		end
+		if src.GetVertexColor then
+			local r, g, b, a = src:GetVertexColor()
+			if r then
+				dst:SetVertexColor(r, g, b, a or 1)
+			end
+		end
+		return true
+	end
+	return false
+end
+
+local function SetFeatTrackerHeaderText(header, text)
+	if not header then
+		return
+	end
+	if header.Text and header.Text.SetText then
+		header.Text:SetText(text)
+	elseif header.SetText then
+		header:SetText(text)
+	elseif header.text and header.text.SetText then
+		header.text:SetText(text)
+	end
+end
+
+local function TrySetAtlas(texture, atlas)
+	if not (texture and atlas and texture.SetAtlas) then
+		return false
+	end
+	return pcall(texture.SetAtlas, texture, atlas, true)
+end
+
+local function ApplyMinimizeButtonIcon(btn, collapsed)
+	if not btn then
+		return
+	end
+	local nt = btn.GetNormalTexture and btn:GetNormalTexture()
+	local pt = btn.GetPushedTexture and btn:GetPushedTexture()
+	if not nt then
+		return
+	end
+
+	-- Forever Quests uses Yellow chrome; retail secondary is the fallback.
+	local expand = {
+		"UI-QuestTrackerButton-Yellow-Expand",
+		"ui-questtrackerbutton-yellow-expand",
+		"ui-questtrackerbutton-secondary-expand",
+	}
+	local expandPressed = {
+		"UI-QuestTrackerButton-Yellow-Expand-Pressed",
+		"ui-questtrackerbutton-yellow-expand-pressed",
+		"ui-questtrackerbutton-secondary-expand-pressed",
+	}
+	local collapse = {
+		"UI-QuestTrackerButton-Yellow-Collapse",
+		"ui-questtrackerbutton-yellow-collapse",
+		"ui-questtrackerbutton-secondary-collapse",
+	}
+	local collapsePressed = {
+		"UI-QuestTrackerButton-Yellow-Collapse-Pressed",
+		"ui-questtrackerbutton-yellow-collapse-pressed",
+		"ui-questtrackerbutton-secondary-collapse-pressed",
+	}
+
+	local normals = collapsed and expand or collapse
+	local pushers = collapsed and expandPressed or collapsePressed
+	for _, atlas in ipairs(normals) do
+		if TrySetAtlas(nt, atlas) then
+			break
+		end
+	end
+	if pt then
+		for _, atlas in ipairs(pushers) do
+			if TrySetAtlas(pt, atlas) then
+				break
+			end
+		end
+	end
+end
+
+local function SyncFeatTrackerMinimizePosition(header)
+	local btn = header and (header.MinimizeButton or header.CollapseButton)
+	local donor = FindQuestTrackerHeaderDonor()
+	local donorBtn = donor and (donor.MinimizeButton or donor.CollapseButton)
+	if not (btn and donorBtn) then
+		return
+	end
+	btn:ClearAllPoints()
+	local point, _, relativePoint, x, y = donorBtn:GetPoint(1)
+	btn:SetPoint(point or "RIGHT", header, relativePoint or "RIGHT", x or 0, y or 0)
+	local w, h = donorBtn:GetSize()
+	if w and w > 0 and h and h > 0 then
+		btn:SetSize(w, h)
+	end
+end
+
+local function FixFeatTrackerMinimizeHighlight(header)
+	-- Pin hover glow on the glyph; do not move the button here.
+	local btn = header and (header.MinimizeButton or header.CollapseButton)
+	if not btn then
+		return
+	end
+
+	local donor = FindQuestTrackerHeaderDonor()
+	local donorBtn = donor and (donor.MinimizeButton or donor.CollapseButton)
+	local hlSrc = donorBtn and donorBtn.GetHighlightTexture and donorBtn:GetHighlightTexture()
+	if hlSrc then
+		local atlas = hlSrc.GetAtlas and hlSrc:GetAtlas()
+		if atlas and atlas ~= "" and btn.SetHighlightAtlas then
+			btn:SetHighlightAtlas(atlas, "ADD")
+		elseif hlSrc.GetTexture and hlSrc:GetTexture() then
+			local blend = (hlSrc.GetBlendMode and hlSrc:GetBlendMode()) or "ADD"
+			btn:SetHighlightTexture(hlSrc:GetTexture(), blend)
+		end
+	end
+
+	local hl = btn:GetHighlightTexture()
+	if not hl then
+		return
+	end
+	local size = 18
+	local nt = btn.GetNormalTexture and btn:GetNormalTexture()
+	if nt then
+		local nw, nh = nt:GetSize()
+		if nw and nw > 0 then
+			size = math.max(nw, nh or nw) + 6
+		end
+	end
+	hl:ClearAllPoints()
+	hl:SetSize(size, size)
+	hl:SetPoint("CENTER", btn, "CENTER", 0, 0)
+end
+
+local function CreateFeatTrackerHeader(parent)
+	-- Prefer Blizzard's real tracker header template (same bar + minimize as Quests).
+	for _, tmpl in ipairs(FEAT_TRACKER_HEADER_TEMPLATES) do
+		local ok, header = pcall(CreateFrame, "Frame", nil, parent, tmpl)
+		if not ok or not header then
+			ok, header = pcall(CreateFrame, "Button", nil, parent, tmpl)
+		end
+		if ok and header then
+			header:SetPoint("TOPLEFT", 0, 0)
+			header:SetPoint("TOPRIGHT", 0, 0)
+			local h = header:GetHeight()
+			if not h or h < 10 then
+				header:SetHeight(FEAT_TRACKER_HEADER_H)
+			end
+			SetFeatTrackerHeaderText(header, "Jump Feats")
+			header._ajhUsesTemplate = true
+			-- Disable Blizzard module toggle (parent isn't a tracker module).
+			if header.OnToggle then
+				header.OnToggle = function() end
+			end
+			SyncFeatTrackerMinimizePosition(header)
+			ApplyMinimizeButtonIcon(header.MinimizeButton or header.CollapseButton, false)
+			FixFeatTrackerMinimizeHighlight(header)
+			return header
+		end
+	end
+
+	-- Fallback: rebuild Quests-style bar from a live donor header.
+	local header = CreateFrame("Frame", nil, parent)
+	header:SetPoint("TOPLEFT", 0, 0)
+	header:SetPoint("TOPRIGHT", 0, 0)
+	header:SetHeight(FEAT_TRACKER_HEADER_H)
+
+	local donor = FindQuestTrackerHeaderDonor()
+	local donorH = donor and donor:GetHeight()
+	if donorH and donorH > 10 then
+		header:SetHeight(donorH)
+	end
+
+	header.Background = header:CreateTexture(nil, "BACKGROUND")
+	header.Background:SetAllPoints()
+	local copied = donor and donor.Background and CopyTextureLook(header.Background, donor.Background)
+	if not copied then
+		-- Approximate Forever Quests header: dark bar + thin gold edges.
+		header.Background:SetColorTexture(0.06, 0.06, 0.06, 0.92)
+		local top = header:CreateTexture(nil, "BORDER")
+		top:SetHeight(1)
+		top:SetPoint("TOPLEFT", 0, 0)
+		top:SetPoint("TOPRIGHT", 0, 0)
+		top:SetColorTexture(0.55, 0.42, 0.18, 0.95)
+		local bottom = header:CreateTexture(nil, "BORDER")
+		bottom:SetHeight(1)
+		bottom:SetPoint("BOTTOMLEFT", 0, 0)
+		bottom:SetPoint("BOTTOMRIGHT", 0, 0)
+		bottom:SetColorTexture(0.55, 0.42, 0.18, 0.95)
+	end
+
+	header.Text = header:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	header.Text:SetPoint("LEFT", 4, 0)
+	header.Text:SetJustifyH("LEFT")
+	header.Text:SetText("Jump Feats")
+	header.Text:SetTextColor(1, 0.82, 0)
+	if donor and donor.Text then
+		local font, size, flags = donor.Text:GetFont()
+		if font then
+			header.Text:SetFont(font, size or 12, flags)
+		end
+		local r, g, b = donor.Text:GetTextColor()
+		if r then
+			header.Text:SetTextColor(r, g, b)
+		end
+	end
+
+	header.MinimizeButton = CreateFrame("Button", nil, header)
+	header.MinimizeButton:SetSize(15, 14)
+	header.MinimizeButton:SetPoint("RIGHT", header, "RIGHT", 0, 0)
+	local donorBtn = donor and (donor.MinimizeButton or donor.CollapseButton)
+	if donorBtn then
+		local ntSrc = donorBtn.GetNormalTexture and donorBtn:GetNormalTexture()
+		local ptSrc = donorBtn.GetPushedTexture and donorBtn:GetPushedTexture()
+		if ntSrc and ntSrc.GetTexture then
+			header.MinimizeButton:SetNormalTexture(ntSrc:GetTexture())
+			local nt = header.MinimizeButton:GetNormalTexture()
+			if nt and ntSrc.GetTexCoord then
+				local l, r, t, b = ntSrc:GetTexCoord()
+				nt:SetTexCoord(l, r, t, b)
+				nt:ClearAllPoints()
+				nt:SetAllPoints()
+			end
+		end
+		if ptSrc and ptSrc.GetTexture then
+			header.MinimizeButton:SetPushedTexture(ptSrc:GetTexture())
+			local pt = header.MinimizeButton:GetPushedTexture()
+			if pt and ptSrc.GetTexCoord then
+				local l, r, t, b = ptSrc:GetTexCoord()
+				pt:SetTexCoord(l, r, t, b)
+				pt:ClearAllPoints()
+				pt:SetAllPoints()
+			end
+		end
+		local hlSrc = donorBtn.GetHighlightTexture and donorBtn:GetHighlightTexture()
+		if hlSrc and hlSrc.GetTexture and hlSrc:GetTexture() then
+			local blend = (hlSrc.GetBlendMode and hlSrc:GetBlendMode()) or "ADD"
+			header.MinimizeButton:SetHighlightTexture(hlSrc:GetTexture(), blend)
+		end
+	else
+		-- Yellow minus (expanded) / plus (collapsed) fallback.
+		local minus = header.MinimizeButton:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		minus:SetPoint("CENTER", 0, 0)
+		minus:SetText("-")
+		minus:SetTextColor(1, 0.82, 0)
+		header.MinimizeButton.label = minus
+	end
+
+	FixFeatTrackerMinimizeHighlight(header)
+	return header
+end
+
+local function ApplyFeatTrackerCollapsed(frame, collapsed)
+	frame.collapsed = not not collapsed
+	local header = frame.header
+	local btn = header and (header.MinimizeButton or header.CollapseButton)
+
+	-- Header mixin owns the +/- atlas swap (not the button).
+	if header and header.SetCollapsed then
+		header:SetCollapsed(frame.collapsed)
+	end
+	-- Forever may use Yellow atlases; force the correct expand/collapse glyph.
+	ApplyMinimizeButtonIcon(btn, frame.collapsed)
+	if header then
+		SyncFeatTrackerMinimizePosition(header)
+		FixFeatTrackerMinimizeHighlight(header)
+	elseif btn and btn.label then
+		btn.label:SetText(frame.collapsed and "+" or "-")
+	end
+
+	for _, line in ipairs(frame.lines or {}) do
+		if frame.collapsed then
+			line:Hide()
+		elseif line.featId then
+			line:Show()
+		end
+	end
+	local n = 0
+	if not frame.collapsed then
+		for _, line in ipairs(frame.lines or {}) do
+			if line.featId then
+				n = n + 1
+			end
+		end
+	end
+	local headerH = (header and header:GetHeight()) or FEAT_TRACKER_HEADER_H
+	frame:SetHeight(headerH + (frame.collapsed and 0 or (FEAT_TRACKER_BELOW_HEADER + n * FEAT_TRACKER_LINE_H)))
+end
+
+local function ConsiderTrackerChild(best, bestBottom, frame, skip)
+	if not frame or frame == skip or not frame.GetBottom then
+		return best, bestBottom
+	end
+	if frame.IsShown and not frame:IsShown() then
+		return best, bestBottom
+	end
+	local h = frame.GetHeight and frame:GetHeight() or 0
+	if h < 12 then
+		return best, bestBottom
+	end
+	local bottom = frame:GetBottom()
+	if not bottom then
+		return best, bestBottom
+	end
+	if not bestBottom or bottom < bestBottom then
+		return frame, bottom
+	end
+	return best, bestBottom
+end
+
+function ns.FindFeatTrackerAnchor()
+	local host = GetObjectiveTrackerHost()
+	if not host then
+		return nil, nil
+	end
+	local skip = ui.featTracker
+	local best, bestBottom = nil, nil
+
+	-- Only named objective modules — not the tall tracker container/scroll child
+	-- (that bottoms out near the bags and caused the floating gap).
+	for _, name in ipairs({
+		"QuestObjectiveTracker",
+		"CampaignQuestObjectiveTracker",
+		"AchievementObjectiveTracker",
+		"AdventureObjectiveTracker",
+		"BonusObjectiveTracker",
+		"WorldQuestObjectiveTracker",
+		"ScenarioObjectiveTracker",
+		"MonthlyActivitiesObjectiveTracker",
+		"UIWidgetObjectiveTracker",
+		"ProfessionRecipeTracker",
+	}) do
+		best, bestBottom = ConsiderTrackerChild(best, bestBottom, _G[name], skip)
+	end
+
+	if type(host.modules) == "table" then
+		for _, module in pairs(host.modules) do
+			if module and (module.Header or module.ContentsFrame or module.BlockTemplate) then
+				best, bestBottom = ConsiderTrackerChild(best, bestBottom, module, skip)
+			end
+		end
+	end
+	if type(host.GetModules) == "function" then
+		local ok, modules = pcall(host.GetModules, host)
+		if ok and type(modules) == "table" then
+			for _, module in pairs(modules) do
+				if module and (module.Header or module.ContentsFrame or module.BlockTemplate) then
+					best, bestBottom = ConsiderTrackerChild(best, bestBottom, module, skip)
+				end
+			end
+		end
+	end
+
+	-- Last resort: Quests header text region inside the host.
+	if not best then
+		local header = host.Header
+		if header then
+			best = header
+		end
+	end
+
+	return host, best
+end
+
+function ns.AnchorFeatTracker()
+	local frame = ui.featTracker
+	if not frame then
+		return
+	end
+
+	local host, content = ns.FindFeatTrackerAnchor()
+	frame:ClearAllPoints()
+
+	if host then
+		frame:SetParent(host)
+		local strata = host.GetFrameStrata and host:GetFrameStrata()
+		if strata then
+			frame:SetFrameStrata(strata)
+		end
+		frame:SetFrameLevel((host.GetFrameLevel and host:GetFrameLevel() or 0) + 20)
+		local w = host:GetWidth() or 235
+		if w > 80 then
+			frame:SetWidth(w)
+		end
+
+		local anchor = content
+		if not anchor and host.Header then
+			anchor = host.Header
+		end
+		if anchor then
+			frame:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -FEAT_TRACKER_GAP)
+			frame:SetPoint("TOPRIGHT", anchor, "BOTTOMRIGHT", 0, -FEAT_TRACKER_GAP)
+		else
+			frame:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -36)
+			frame:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, -36)
+		end
+	elseif MinimapCluster then
+		frame:SetParent(UIParent)
+		frame:SetWidth(235)
+		frame:SetPoint("TOPRIGHT", MinimapCluster, "BOTTOMRIGHT", -8, -16)
+	else
+		frame:SetParent(UIParent)
+		frame:SetWidth(235)
+		frame:SetPoint("TOPRIGHT", UIParent, "TOPRIGHT", -90, -220)
+	end
+end
+
+function ns.EnsureFeatTracker()
+	if ui.featTracker then
+		ns.UpdateFeatTracker()
+		return ui.featTracker
+	end
+
+	local frame = CreateFrame("Frame", "AJHFeatTracker", UIParent)
+	frame:SetWidth(235)
+	frame:SetHeight(FEAT_TRACKER_HEADER_H)
+	frame:SetClampedToScreen(true)
+	frame:Hide()
+	ui.featTracker = frame
+	frame.collapsed = false
+
+	local header = CreateFeatTrackerHeader(frame)
+	frame.header = header
+	local headerH = header:GetHeight() or FEAT_TRACKER_HEADER_H
+
+	local function ToggleCollapse()
+		ApplyFeatTrackerCollapsed(frame, not frame.collapsed)
+		ns.PlayUISound("IG_MAINMENU_OPTION_CHECKBOX_ON", 856)
+	end
+	local minBtn = header.MinimizeButton or header.CollapseButton
+	if minBtn then
+		minBtn:SetScript("OnClick", ToggleCollapse)
+		SyncFeatTrackerMinimizePosition(header)
+		ApplyMinimizeButtonIcon(minBtn, false)
+		FixFeatTrackerMinimizeHighlight(header)
+	end
+	if header.SetHighlightTexture then
+		header:SetHighlightTexture(nil)
+	end
+	if header.SetHighlightAtlas then
+		pcall(header.SetHighlightAtlas, header, nil)
+	end
+
+	frame.lines = {}
+	for i = 1, ns.MAX_TRACKED_FEATS or 5 do
+		local line = CreateFrame("Button", nil, frame)
+		line:SetHeight(FEAT_TRACKER_LINE_H)
+		line:SetPoint("TOPLEFT", 0, -(headerH + FEAT_TRACKER_BELOW_HEADER + (i - 1) * FEAT_TRACKER_LINE_H))
+		line:SetPoint("TOPRIGHT", 0, -(headerH + FEAT_TRACKER_BELOW_HEADER + (i - 1) * FEAT_TRACKER_LINE_H))
+		line:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+		line:Hide()
+
+		line.icon = line:CreateTexture(nil, "ARTWORK")
+		line.icon:SetSize(16, 16)
+		line.icon:SetPoint("TOPLEFT", 0, -1)
+		line.icon:SetTexture("Interface\\AddOns\\AJH\\AJH-gold-frog")
+		if line.icon.SetTexCoord then
+			line.icon:SetTexCoord(0.06, 0.94, 0.06, 0.94)
+		end
+		if line.icon.SetBlendMode then
+			line.icon:SetBlendMode("BLEND")
+		end
+
+		-- Quest-title style (yellow), then dashed objective under it.
+		line.title = line:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+		line.title:SetPoint("TOPLEFT", 18, 0)
+		line.title:SetPoint("TOPRIGHT", 0, 0)
+		line.title:SetJustifyH("LEFT")
+		line.title:SetTextColor(1, 0.82, 0)
+		line.title:SetWordWrap(false)
+		if line.title.SetMaxLines then
+			line.title:SetMaxLines(1)
+		end
+
+		line.obj = line:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		line.obj:SetPoint("TOPLEFT", line.title, "BOTTOMLEFT", 0, -1)
+		line.obj:SetPoint("RIGHT", 0, 0)
+		line.obj:SetJustifyH("LEFT")
+		line.obj:SetTextColor(0.8, 0.8, 0.8)
+		line.obj:SetWordWrap(false)
+		if line.obj.SetMaxLines then
+			line.obj:SetMaxLines(1)
+		end
+
+		line:SetScript("OnClick", function(self, button)
+			if not self.featId then
+				return
+			end
+			if button == "RightButton" or IsShiftKeyDown() then
+				ns.ToggleFeatTrack(self.featId)
+				if S.panel and S.panel:IsShown() and S.activeTab == "achieves" and ns.UpdateAchievements then
+					ns.UpdateAchievements()
+				end
+			elseif ns.TogglePanel then
+				ns.EnsureUIBuilt()
+				if S.panel and not S.panel:IsShown() then
+					ns.TogglePanel()
+				end
+				if ns.SetTab then
+					ns.SetTab("achieves")
+				end
+			end
+		end)
+		line:SetScript("OnEnter", function(self)
+			if not self.featId then
+				return
+			end
+			local ach = ns.FindAchievement(self.featId)
+			GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+			GameTooltip:SetText(ach and ach.name or self.featId, 1, 0.82, 0)
+			if ach and ach.desc then
+				GameTooltip:AddLine(ach.desc, 0.9, 0.9, 0.9, true)
+			end
+			GameTooltip:AddLine("Click to open Feats", 0.65, 0.65, 0.65)
+			GameTooltip:AddLine("Shift-click or right-click to untrack", 0.65, 0.65, 0.65)
+			GameTooltip:Show()
+		end)
+		line:SetScript("OnLeave", function()
+			GameTooltip:Hide()
+		end)
+
+		frame.lines[i] = line
+	end
+
+	local elapsed = 0
+	frame:SetScript("OnUpdate", function(self, dt)
+		if not self:IsShown() then
+			return
+		end
+		elapsed = elapsed + dt
+		if elapsed < 0.4 then
+			return
+		end
+		elapsed = 0
+		ns.AnchorFeatTracker()
+	end)
+
+	local reanchor = CreateFrame("Frame")
+	reanchor:RegisterEvent("PLAYER_ENTERING_WORLD")
+	reanchor:RegisterEvent("QUEST_WATCH_LIST_CHANGED")
+	reanchor:RegisterEvent("QUEST_LOG_UPDATE")
+	reanchor:SetScript("OnEvent", function()
+		ns.AnchorFeatTracker()
+		ns.UpdateFeatTracker()
+	end)
+
+	local host = GetObjectiveTrackerHost()
+	if host then
+		if host.HookScript then
+			host:HookScript("OnShow", function()
+				ns.UpdateFeatTracker()
+			end)
+			host:HookScript("OnSizeChanged", function()
+				ns.AnchorFeatTracker()
+				ns.UpdateFeatTracker()
+			end)
+		end
+		if type(host.Update) == "function" then
+			hooksecurefunc(host, "Update", function()
+				ns.UpdateFeatTracker()
+			end)
+		end
+	end
+	HookObjectiveTrackerCollapse()
+
+	ns.UpdateFeatTracker()
+	return frame
+end
+
+function ns.UpdateFeatTracker()
+	if not ui.featTracker then
+		return
+	end
+	HookObjectiveTrackerCollapse()
+	local frame = ui.featTracker
+	local list = ns.GetTrackedFeatList and ns.GetTrackedFeatList() or {}
+	local n = #list
+	if n == 0 or IsObjectiveTrackerHostCollapsed() then
+		frame:Hide()
+		return
+	end
+
+	SetFeatTrackerHeaderText(frame.header, "Jump Feats")
+
+	for i, line in ipairs(frame.lines) do
+		local ach = list[i]
+		if ach then
+			line.featId = ach.id
+			line.title:SetText(ach.name)
+			line.obj:SetText("- " .. (ach.desc or ""))
+			if not frame.collapsed then
+				line:Show()
+			else
+				line:Hide()
+			end
+		else
+			line.featId = nil
+			line:Hide()
+		end
+	end
+
+	ApplyFeatTrackerCollapsed(frame, frame.collapsed)
+	ns.AnchorFeatTracker()
+	frame:Show()
 end
 
 function ns.TogglePanel()
@@ -2569,8 +4541,28 @@ function ns.UpdateMinimapButtonPosition()
 	minimapButton:SetPoint("CENTER", Minimap, "CENTER", math.cos(angle) * radius, math.sin(angle) * radius)
 end
 
+function ns.SetMinimapButtonShown(shown)
+	ns.EnsureDB()
+	local db = ns.DB()
+	if not db then
+		return
+	end
+	db.showMinimapButton = not not shown
+	if not minimapButton then
+		ns.BuildMinimapButton()
+		return
+	end
+	if db.showMinimapButton then
+		minimapButton:Show()
+		ns.UpdateMinimapButtonPosition()
+	else
+		minimapButton:Hide()
+	end
+end
+
 function ns.BuildMinimapButton()
 	if minimapButton then
+		ns.SetMinimapButtonShown(ns.DB() and ns.DB().showMinimapButton ~= false)
 		return minimapButton
 	end
 
@@ -2661,5 +4653,10 @@ function ns.BuildMinimapButton()
 
 	minimapButton = btn
 	ns.UpdateMinimapButtonPosition()
+	if ns.DB() and ns.DB().showMinimapButton == false then
+		btn:Hide()
+	else
+		btn:Show()
+	end
 	return btn
 end

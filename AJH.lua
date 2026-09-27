@@ -15,8 +15,10 @@ BINDING_NAME_AJH_TOGGLE = "Toggle Archindula's Jump Habit"
 
 local MAX_LEVEL = 99
 ns.MAX_LEVEL = MAX_LEVEL
-local XP_PER_JUMP = 1
-local CAMP_XP_MULTIPLIER = 2
+ns.XP_PER_JUMP = 1
+local XP_PER_JUMP = ns.XP_PER_JUMP
+ns.CAMP_XP_MULTIPLIER = 2
+local CAMP_XP_MULTIPLIER = ns.CAMP_XP_MULTIPLIER
 local ADDON_PREFIX = "AJH"
 ns.ADDON_PREFIX = ADDON_PREFIX
 local ROW_HEIGHT = 22
@@ -342,6 +344,9 @@ function ns.FillDBDefaults(db)
 	if type(db.achievements) ~= "table" then
 		db.achievements = {}
 	end
+	if type(db.trackedFeats) ~= "table" then
+		db.trackedFeats = {}
+	end
 	if type(db.jumpXPBar) ~= "table" then
 		db.jumpXPBar = {}
 	end
@@ -439,6 +444,16 @@ function ns.FillDBDefaults(db)
 		db.autoAnnounce = false
 	else
 		db.autoAnnounce = not not db.autoAnnounce
+	end
+	if db.showMinimapButton == nil then
+		db.showMinimapButton = true
+	else
+		db.showMinimapButton = not not db.showMinimapButton
+	end
+	if db.showFeatToasts == nil then
+		db.showFeatToasts = true
+	else
+		db.showFeatToasts = not not db.showFeatToasts
 	end
 	db.sessionJumpHigh = math.max(0, math.floor(ns.ToNumberOr(db.sessionJumpHigh, 0) or 0))
 	db.playTime = math.max(0, ns.ToNumberOr(db.playTime, 0) or 0)
@@ -1028,6 +1043,124 @@ function ns.CountCategoryProgress(categoryId)
 	end
 	return earned, total
 end
+
+ns.MAX_TRACKED_FEATS = 5
+
+function ns.FindAchievement(id)
+	if not id then
+		return nil
+	end
+	for _, ach in ipairs(ACHIEVEMENTS) do
+		if ach.id == id then
+			return ach
+		end
+	end
+	return nil
+end
+
+function ns.IsFeatTracked(id)
+	local db = ns.DB()
+	if type(db) ~= "table" or type(db.trackedFeats) ~= "table" then
+		return false
+	end
+	for _, trackedId in ipairs(db.trackedFeats) do
+		if trackedId == id then
+			return true
+		end
+	end
+	return false
+end
+
+-- Drop completed / unknown ids. Returns true if the list changed.
+function ns.PruneTrackedFeats()
+	local db = ns.EnsureDB()
+	if not db or type(db.trackedFeats) ~= "table" then
+		return false
+	end
+	local achs = db.achievements
+	local kept = {}
+	local changed = false
+	for _, id in ipairs(db.trackedFeats) do
+		local ach = ns.FindAchievement(id)
+		if ach and not (achs and achs[id]) then
+			kept[#kept + 1] = id
+		else
+			changed = true
+		end
+	end
+	if changed or #kept ~= #db.trackedFeats then
+		db.trackedFeats = kept
+		return true
+	end
+	return false
+end
+
+function ns.GetTrackedFeatList()
+	ns.PruneTrackedFeats()
+	local db = ns.DB()
+	local list = {}
+	if type(db) ~= "table" or type(db.trackedFeats) ~= "table" then
+		return list
+	end
+	for _, id in ipairs(db.trackedFeats) do
+		local ach = ns.FindAchievement(id)
+		if ach then
+			list[#list + 1] = ach
+		end
+	end
+	return list
+end
+
+function ns.ToggleFeatTrack(id)
+	local db = ns.EnsureDB()
+	if not db or not id then
+		return false
+	end
+	if type(db.trackedFeats) ~= "table" then
+		db.trackedFeats = {}
+	end
+
+	for i, trackedId in ipairs(db.trackedFeats) do
+		if trackedId == id then
+			table.remove(db.trackedFeats, i)
+			local ach = ns.FindAchievement(id)
+			DEFAULT_CHAT_FRAME:AddMessage(string.format(
+				"|cff88ff88AJH:|r Stopped tracking |cffffffff%s|r.",
+				ach and ach.name or id
+			))
+			if ns.UpdateFeatTracker then
+				ns.UpdateFeatTracker()
+			end
+			return false
+		end
+	end
+
+	if db.achievements and db.achievements[id] then
+		DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH:|r That feat is already complete.")
+		return false
+	end
+	if not ns.FindAchievement(id) then
+		return false
+	end
+	if #db.trackedFeats >= ns.MAX_TRACKED_FEATS then
+		DEFAULT_CHAT_FRAME:AddMessage(string.format(
+			"|cff88ff88AJH:|r Already tracking %d feats (max).",
+			ns.MAX_TRACKED_FEATS
+		))
+		return false
+	end
+
+	db.trackedFeats[#db.trackedFeats + 1] = id
+	local ach = ns.FindAchievement(id)
+	DEFAULT_CHAT_FRAME:AddMessage(string.format(
+		"|cff88ff88AJH:|r Tracking |cffffffff%s|r.",
+		ach and ach.name or id
+	))
+	if ns.UpdateFeatTracker then
+		ns.UpdateFeatTracker()
+	end
+	return true
+end
 -- Shared UI/toast state (same ns.S table as above).
 S.activeTab = S.activeTab or "habit"
 S.toastQueue = S.toastQueue or {}
@@ -1171,6 +1304,12 @@ function ns.QueueToast(toast)
 end
 
 function ns.QueueAchievementToast(ach)
+	local db = ns.DB()
+	if db and db.showFeatToasts == false then
+		-- Banner off; still play fanfare when sounds are enabled.
+		ns.PlayAchievementSound()
+		return
+	end
 	ns.QueueToast({
 		banner = "FEAT UNLOCKED",
 		name = ach.name,
@@ -1267,6 +1406,10 @@ function ns.UnlockAchievement(ach)
 
 	db.achievements[ach.id] = time()
 	ns.InvalidateOwnAchCount()
+	ns.PruneTrackedFeats()
+	if ns.UpdateFeatTracker then
+		ns.UpdateFeatTracker()
+	end
 	DEFAULT_CHAT_FRAME:AddMessage(string.format(
 		"|cff88ff88AJH:|r Feat unlocked: |cffffffff%s|r - %s",
 		ach.name,
@@ -1326,9 +1469,13 @@ function ns.ResetAchievements()
 		return
 	end
 	db.achievements = {}
+	db.trackedFeats = {}
 	ns.InvalidateOwnAchCount()
 	ns.BroadcastScore()
 	DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH:|r Feats reset for testing.")
+	if ns.UpdateFeatTracker then
+		ns.UpdateFeatTracker()
+	end
 	if S.panel and S.panel:IsShown() then
 		if S.activeTab == "achieves" then
 			ns.UpdateAchievements()
@@ -1506,11 +1653,20 @@ end
 
 function ns.ShowStatsView(view)
 	ui.statsView = view or "main"
-	if ui.statsMain then
-		ui.statsMain:SetShown(ui.statsView == "main")
+	local showMain = ui.statsView == "main"
+	if ui.statsWrap then
+		ui.statsWrap:SetShown(showMain)
+	elseif ui.statsMain then
+		ui.statsMain:SetShown(showMain)
+	end
+	if ui.levelsButton then
+		ui.levelsButton:SetShown(showMain)
 	end
 	if ui.statsLevels then
 		ui.statsLevels:SetShown(ui.statsView == "levels")
+	end
+	if showMain and type(ui.LayoutStatsScroll) == "function" then
+		C_Timer.After(0, ui.LayoutStatsScroll)
 	end
 	if ui.statsView == "levels" and ui.levelScroll then
 		ns.EnsureDB()
@@ -1589,6 +1745,9 @@ function ns.EnsureUIBuilt()
 	ns.BuildPanel()
 	ns.BuildJumpXPBar()
 	ns.BuildMinimapButton()
+	if ns.EnsureFeatTracker then
+		ns.EnsureFeatTracker()
+	end
 	if not jumpHookInstalled then
 		jumpHookInstalled = true
 		hooksecurefunc("JumpOrAscendStart", ns.OnJump)
@@ -1822,6 +1981,86 @@ SlashCmdList.AJH = function(msg)
 	end
 	if msg == "diag" or msg:match("^diag") then
 		ns.DiagReport("manual")
+		return
+	end
+	if msg == "dumpframe" or msg == "dumpui" then
+		ns.EnsureDB()
+		local lines = {}
+		local function add(s)
+			lines[#lines + 1] = s
+			DEFAULT_CHAT_FRAME:AddMessage("|cff88ff88AJH:|r " .. s)
+		end
+		local function dumpFrame(f, label, depth)
+			if not f or depth > 3 then
+				return
+			end
+			local name = (f.GetName and f:GetName()) or "(anon)"
+			local objType = (f.GetObjectType and f:GetObjectType()) or "?"
+			add(string.format("%s%s [%s]", label, name, objType))
+			if f.backdropInfo then
+				local bi = f.backdropInfo
+				add(string.format("  backdrop edge=%s edgeSize=%s bg=%s",
+					tostring(bi.edgeFile), tostring(bi.edgeSize), tostring(bi.bgFile)))
+			end
+			if f.GetBackdropBorderColor then
+				local r, g, b, a = f:GetBackdropBorderColor()
+				if r then
+					add(string.format("  borderColor=%.2f,%.2f,%.2f,%.2f", r, g, b or 1, a or 1))
+				end
+			end
+			if f.NineSlice then
+				add("  has NineSlice")
+				for _, key in ipairs({
+					"TopLeftCorner", "TopRightCorner", "BottomLeftCorner", "BottomRightCorner",
+					"TopEdge", "BottomEdge", "LeftEdge", "RightEdge",
+				}) do
+					local p = f.NineSlice[key]
+					if p then
+						local atlas = p.GetAtlas and p:GetAtlas()
+						local tex = p.GetTexture and p:GetTexture()
+						add(string.format("  NS.%s atlas=%s tex=%s", key, tostring(atlas), tostring(tex)))
+					end
+				end
+			end
+			if f.GetNumRegions then
+				for i = 1, f:GetNumRegions() do
+					local r = select(i, f:GetRegions())
+					if r and r.GetObjectType and r:GetObjectType() == "Texture" then
+						local atlas = r.GetAtlas and r:GetAtlas()
+						local tex = r.GetTexture and r:GetTexture()
+						if (atlas and atlas ~= "") or tex then
+							add(string.format("  tex[%d] atlas=%s file=%s", i, tostring(atlas), tostring(tex)))
+						end
+					end
+				end
+			end
+			if depth < 2 and f.GetChildren then
+				local kids = { f:GetChildren() }
+				for i = 1, math.min(#kids, 12) do
+					dumpFrame(kids[i], label .. "  ", depth + 1)
+				end
+			end
+		end
+		local focus = GetMouseFoci and GetMouseFoci() or nil
+		local target = focus and focus[1]
+		if not target and GetMouseFocus then
+			target = GetMouseFocus()
+		end
+		add("--- mouse focus ---")
+		dumpFrame(target, "", 0)
+		for _, n in ipairs({
+			"PrimaryProfession1", "PrimaryProfession2",
+			"SecondaryProfession1", "SecondaryProfession2", "SecondaryProfession3",
+			"SpellBookFrame",
+		}) do
+			if _G[n] then
+				add("--- " .. n .. " ---")
+				dumpFrame(_G[n], "", 0)
+			end
+		end
+		AJHSaved = AJHSaved or {}
+		AJHSaved.uiDump = table.concat(lines, "\n")
+		add("Saved to AJHSaved.uiDump — /reload then share if needed.")
 		return
 	end
 	ns.EnsureDB()
