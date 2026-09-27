@@ -3540,6 +3540,7 @@ function ns.BuildPanel()
 	announceCheck:SetScript("OnClick", function(self)
 		ns.EnsureDB()
 		ns.DB().autoAnnounce = not not self:GetChecked()
+		ns.PersistStoreMirror()
 	end)
 	ui.announceCheck = announceCheck
 
@@ -3547,6 +3548,7 @@ function ns.BuildPanel()
 	xpBarCheck:SetScript("OnClick", function(self)
 		ns.EnsureDB()
 		ns.SetJumpXPBarShown(not not self:GetChecked())
+		ns.PersistStoreMirror()
 	end)
 	ui.jumpXPBarCheck = xpBarCheck
 
@@ -3554,6 +3556,7 @@ function ns.BuildPanel()
 	minimapCheck:SetScript("OnClick", function(self)
 		ns.EnsureDB()
 		ns.SetMinimapButtonShown(not not self:GetChecked())
+		ns.PersistStoreMirror()
 	end)
 	ui.minimapCheck = minimapCheck
 
@@ -3561,6 +3564,7 @@ function ns.BuildPanel()
 	toastCheck:SetScript("OnClick", function(self)
 		ns.EnsureDB()
 		ns.DB().showFeatToasts = not not self:GetChecked()
+		ns.PersistStoreMirror()
 	end)
 	ui.toastCheck = toastCheck
 
@@ -3574,6 +3578,7 @@ function ns.BuildPanel()
 	soundCheck:SetScript("OnClick", function(self)
 		ns.EnsureDB()
 		ns.DB().soundsEnabled = not not self:GetChecked()
+		ns.PersistStoreMirror()
 	end)
 	ui.soundCheck = soundCheck
 
@@ -3645,6 +3650,7 @@ function ns.BuildPanel()
 		if ui.soundVolumeValue then
 			ui.soundVolumeValue:SetText(tostring(value))
 		end
+		ns.PersistStoreMirror()
 	end)
 	ui.soundVolumeSlider = volumeSlider
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.1
+
+**Fix — SavedVariables actually persist (SpaceToAccept / wiki pattern)**
+
+- Root cause: ephemeral "never invent AJHSaved" left `AJHSaved = nil` on disk every logout, so nothing reloaded
+- Match working Forever addons: `## LoadSavedVariablesFirst: 1`, bind `AJHSaved = {}` if missing on `ADDON_LOADED`, always mutate the real SV table
+- Companion AJH Store remains a plain second mirror only
+
 ## 1.4.0
 
 **Forever UI polish, Jump Feats tracker, and Settings**

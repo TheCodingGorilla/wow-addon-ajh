@@ -94,8 +94,7 @@ function ns.ToNumberOr(value, fallback)
 	return fallback
 end
 
--- Layout quality for raise-only merges. Visibility (shown) is intentionally
--- excluded so hiding the bar cannot be blocked as a "demotion".
+-- Layout quality for Edit Mode bar commits (not a save watermark).
 function ns.JumpXPBarLayoutScore(bar)
 	if type(bar) ~= "table" then
 		return -1
@@ -131,116 +130,86 @@ function ns.CopyJumpXPBarTable(src)
 	}
 end
 
-function ns.PreferJumpXPBar(destBar, srcBar)
-	if ns.JumpXPBarLayoutScore(srcBar) > ns.JumpXPBarLayoutScore(destBar) then
-		return ns.CopyJumpXPBarTable(srcBar)
-	end
-	-- Same layout quality: still prefer a copy that is shown / has shown flag
-	-- only when dest has no bar at all.
-	if type(destBar) ~= "table" and type(srcBar) == "table" then
-		return ns.CopyJumpXPBarTable(srcBar)
-	end
-	return nil
-end
-
 -- Progress lives in account SavedVariable AJHSaved (see TOC).
--- Mutate the loaded table. Client saves on logout /reload.
--- Never invent AJHSaved = {} when the client failed to load it Ã¢â‚¬â€ that empties the WTF file.
-function ns.RaiseNumber(dest, key, srcValue)
-	local incoming = ns.ToNumberOr(srcValue, nil)
-	if type(incoming) ~= "number" then
-		return false
+-- Pattern matches SpaceToAccept + warcraft.wiki.gg AddOn loading process:
+--   ## LoadSavedVariablesFirst: 1
+--   On ADDON_LOADED / EnsureDB: if type(AJHSaved) ~= "table" then AJHSaved = {} end
+--   Always mutate the real SV table so logout writes data (not AJHSaved = nil).
+-- Companion AJHStoreDB is a second plain mirror only.
+
+local MIRROR_SCALARS = {
+	"jumps",
+	"xp",
+	"soundsEnabled",
+	"soundVolume",
+	"autoAnnounce",
+	"showMinimapButton",
+	"showFeatToasts",
+	"showJumpXPBar",
+	"minimapPos",
+	"playTime",
+	"jumpActivityTime",
+	"sessionJumpHigh",
+	"announceCount",
+}
+
+local MIRROR_TABLES = {
+	"achievements",
+	"trackedFeats",
+	"board",
+	"jumpXPBar",
+	"jumpXPBarLayouts",
+	"jumpDayKeys",
+}
+
+function ns.CopyTable(src)
+	if type(src) ~= "table" then
+		return nil
 	end
-	local current = ns.ToNumberOr(dest[key], 0)
-	if incoming > current then
-		dest[key] = incoming
-		return true
+	local out = {}
+	for k, v in pairs(src) do
+		if type(v) == "table" then
+			out[k] = ns.CopyTable(v)
+		else
+			out[k] = v
+		end
 	end
-	return false
+	return out
 end
 
-function ns.RaiseMergeRecord(dest, src)
+-- Plain field copy src → dest. Current truth wins.
+function ns.CopySavedState(dest, src)
 	if type(dest) ~= "table" or type(src) ~= "table" or dest == src then
 		return false
 	end
-	local raised = false
-	if ns.RaiseNumber(dest, "jumps", src.jumps) then
-		raised = true
-	end
-	if ns.RaiseNumber(dest, "xp", src.xp) then
-		raised = true
-	end
-	if ns.RaiseNumber(dest, "playTime", src.playTime) then
-		raised = true
-	end
-	if ns.RaiseNumber(dest, "jumpActivityTime", src.jumpActivityTime) then
-		raised = true
-	end
-	if ns.RaiseNumber(dest, "sessionJumpHigh", src.sessionJumpHigh) then
-		raised = true
-	end
-	if type(src.achievements) == "table" then
-		if type(dest.achievements) ~= "table" then
-			dest.achievements = {}
-		end
-		for id, when in pairs(src.achievements) do
-			if dest.achievements[id] == nil then
-				dest.achievements[id] = when
-				raised = true
-			end
+	for _, key in ipairs(MIRROR_SCALARS) do
+		if src[key] ~= nil then
+			dest[key] = src[key]
 		end
 	end
-	if type(src.board) == "table" then
-		if type(dest.board) ~= "table" then
-			dest.board = {}
-		end
-		for key, entry in pairs(src.board) do
-			if type(entry) == "table" then
-				local existing = dest.board[key]
-				if type(existing) ~= "table" then
-					dest.board[key] = entry
-					raised = true
-				elseif ns.ToNumberOr(entry.jumps, 0) > ns.ToNumberOr(existing.jumps, 0) then
-					dest.board[key] = entry
-					raised = true
-				end
-			end
+	for _, key in ipairs(MIRROR_TABLES) do
+		if type(src[key]) == "table" then
+			dest[key] = ns.CopyTable(src[key])
 		end
 	end
-	if type(src.jumpXPBar) == "table" then
-		local preferred = ns.PreferJumpXPBar(dest.jumpXPBar, src.jumpXPBar)
-		if preferred then
-			dest.jumpXPBar = preferred
-			if dest.jumpXPBar.shown then
-				dest.showJumpXPBar = true
-			end
-			raised = true
-		end
-	end
-	if type(src.jumpXPBarLayouts) == "table" then
-		if type(dest.jumpXPBarLayouts) ~= "table" then
-			dest.jumpXPBarLayouts = {}
-		end
-		for layoutName, layout in pairs(src.jumpXPBarLayouts) do
-			if type(layout) == "table" then
-				local preferred = ns.PreferJumpXPBar(dest.jumpXPBarLayouts[layoutName], layout)
-				if preferred or type(dest.jumpXPBarLayouts[layoutName]) ~= "table" then
-					dest.jumpXPBarLayouts[layoutName] = preferred or ns.CopyJumpXPBarTable(layout)
-					raised = true
-				end
-			end
-		end
-	end
-	if src.minimapPos ~= nil and dest.minimapPos == nil then
-		dest.minimapPos = src.minimapPos
-	end
-	if src.showJumpXPBar and not dest.showJumpXPBar then
-		dest.showJumpXPBar = true
-		raised = true
-	end
-	return raised
+	return true
 end
 
+-- Mirror live state into companion AJHStoreDB (Forever SV miss backup).
+function ns.PersistStoreMirror()
+	local db = liveDB
+	if type(db) ~= "table" then
+		return false
+	end
+	if type(AJHStoreDB) ~= "table" then
+		AJHStoreDB = {}
+	end
+	ns.CopySavedState(AJHStoreDB, db)
+	if time then
+		AJHStoreDB.updated = time()
+	end
+	return true
+end
 local debugLogLines = {}
 local debugCopyFrame
 
@@ -464,59 +433,32 @@ function ns.FillDBDefaults(db)
 	db.announceCount = math.max(0, math.floor(ns.ToNumberOr(db.announceCount, 0) or 0))
 end
 
--- Forever sometimes leaves AJHSaved nil after /reload or a full restart even
--- when the WTF file is fine. Creating AJHSaved = {} would then be saved over
--- the good file. Use an ephemeral session table until/unless AJHSaved appears.
-local svReady = false
-local sessionDB = nil
-local liveDB = nil
-local warnedMissingSV = false
+-- SavedVariables: match SpaceToAccept / wiki pattern.
+-- ## LoadSavedVariablesFirst: 1 on TOC — SV available before file bodies / on ADDON_LOADED.
+-- Always bind to the real AJHSaved table (invent {} if nil). Ephemeral sessions left
+-- AJHSaved = nil on disk, so the client rewrote a useless save every logout.
 local dbDefaultsReady = false
+local liveDB = nil
 
-function ns.AdoptSavedIfPresent()
+function ns.EnsureDB()
 	if type(AJHSaved) ~= "table" then
-		return false
+		AJHSaved = {}
 	end
-	if sessionDB and sessionDB ~= AJHSaved then
-		ns.RaiseMergeRecord(AJHSaved, sessionDB)
-		sessionDB = nil
+	-- One-time pull from companion store if primary is empty and store has data.
+	if type(AJHStoreDB) == "table"
+		and ns.ToNumberOr(AJHSaved.jumps, 0) <= 0
+		and ns.ToNumberOr(AJHStoreDB.jumps, 0) > 0 then
+		ns.CopySavedState(AJHSaved, AJHStoreDB)
 		dbDefaultsReady = false
-		ns.InvalidateOwnAchCount()
 	end
-	-- Fill defaults once per adopt/merge Ã¢â‚¬â€ not on every EnsureDB (jump hot path).
 	if liveDB ~= AJHSaved or not dbDefaultsReady then
 		ns.FillDBDefaults(AJHSaved)
 		dbDefaultsReady = true
 	end
 	liveDB = AJHSaved
-	return true
+	return AJHSaved
 end
 
-function ns.EnsureDB()
-	if ns.AdoptSavedIfPresent() then
-		return AJHSaved
-	end
-	if not svReady then
-		liveDB = nil
-		return nil
-	end
-	if not sessionDB then
-		sessionDB = {}
-		ns.FillDBDefaults(sessionDB)
-		dbDefaultsReady = true
-		if not warnedMissingSV and DEFAULT_CHAT_FRAME then
-			warnedMissingSV = true
-			DEFAULT_CHAT_FRAME:AddMessage(
-				"|cffff6666AJH:|r Forever failed to load saved progress. This session is temporary and will |cffffcc00not|r overwrite your WTF file. Try another /reload or a full restart later."
-			)
-		end
-	end
-	liveDB = sessionDB
-	return sessionDB
-end
-
--- Gameplay reads/writes go through ns.DB() so ephemeral sessions work without
--- assigning the empty table to the AJHSaved global (which would wipe WTF).
 function ns.DB()
 	if type(liveDB) == "table" then
 		return liveDB
@@ -524,25 +466,11 @@ function ns.DB()
 	return ns.EnsureDB()
 end
 
+-- Kept for callers; primary SV is always bound now.
 function ns.TryLateSavedAdopt()
-	if not ns.AdoptSavedIfPresent() then
-		return
-	end
-	if DEFAULT_CHAT_FRAME then
-		DEFAULT_CHAT_FRAME:AddMessage(string.format(
-			"|cff88ff88AJH:|r Saved progress loaded late Ã¢â‚¬â€ %s jumps (%s XP).",
-			tostring(AJHSaved.jumps or 0),
-			tostring(AJHSaved.xp or 0)
-		))
-	end
-	if S.panel then
-		S.panel:Update()
-	end
-	if ns.RestoreJumpXPBarFromSaved then
-		ns.RestoreJumpXPBarFromSaved()
-	end
+	ns.EnsureDB()
+	ns.PersistStoreMirror()
 end
-
 function ns.DiagReport(tag)
 	ns.DebugDump(tag == "manual" and "manual diag" or (tag or "diag"))
 end
@@ -1131,6 +1059,7 @@ function ns.ToggleFeatTrack(id)
 			if ns.UpdateFeatTracker then
 				ns.UpdateFeatTracker()
 			end
+			ns.PersistStoreMirror()
 			return false
 		end
 	end
@@ -1159,6 +1088,7 @@ function ns.ToggleFeatTrack(id)
 	if ns.UpdateFeatTracker then
 		ns.UpdateFeatTracker()
 	end
+	ns.PersistStoreMirror()
 	return true
 end
 -- Shared UI/toast state (same ns.S table as above).
@@ -1721,6 +1651,7 @@ function ns.OnJump()
 		ns.BroadcastScore()
 	elseif db.jumps % 25 == 0 then
 		ns.BroadcastScore()
+		ns.PersistStoreMirror()
 	end
 	if ns.CheckAchievementsOnJump({ idleGap = idleGap, dayStreak = dayStreak, fromJump = true }) and S.panel and S.panel:IsShown() and S.activeTab == "achieves" then
 		ns.UpdateAchievements()
@@ -1776,33 +1707,24 @@ loader:SetScript("OnEvent", function(self, event, ...)
 		if name ~= ADDON_NAME then
 			return
 		end
+		-- SpaceToAccept pattern: bind SV immediately on ADDON_LOADED.
+		ns.EnsureDB()
+		ns.PersistStoreMirror()
 		if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
 			C_ChatInfo.RegisterAddonMessagePrefix(ADDON_PREFIX)
 		elseif RegisterAddonMessagePrefix then
 			RegisterAddonMessagePrefix(ADDON_PREFIX)
 		end
 	elseif event == "PLAYER_LOGIN" then
-		svReady = true
-		local db = ns.EnsureDB()
+		ns.EnsureDB()
+		ns.PersistStoreMirror()
 		ns.DebugDump("PLAYER_LOGIN")
 		ns.EnsureUIBuilt()
-		if type(AJHSaved) == "table" then
-			DEFAULT_CHAT_FRAME:AddMessage(string.format(
-				"|cff88ff88AJH:|r Loaded %s jumps (%s XP).",
-				ns.FormatNumber(ns.DB().jumps),
-				ns.FormatNumber(ns.DB().xp)
-			))
-		elseif db then
-			DEFAULT_CHAT_FRAME:AddMessage(string.format(
-				"|cffffcc00AJH:|r Starting temporary session at %s jumps (save file not loaded).",
-				ns.FormatNumber(db.jumps)
-			))
-		end
-		-- Forever often fails to load account SavedVariables after /reload or a
-		-- full restart. We never invent AJHSaved={} so a good WTF file is kept.
-		DEFAULT_CHAT_FRAME:AddMessage(
-			"|cffffcc00AJH:|r Forever bug ? addon saves sometimes never load after /reload or a full restart (WTF file can still be fine). AJH will not overwrite your save with zeros while that happens."
-		)
+		DEFAULT_CHAT_FRAME:AddMessage(string.format(
+			"|cff88ff88AJH:|r Loaded %s jumps (%s XP).",
+			ns.FormatNumber(ns.DB().jumps),
+			ns.FormatNumber(ns.DB().xp)
+		))
 		ns.RefreshCampBenefit()
 		if S.panel then
 			S.panel:Update()
@@ -1810,23 +1732,21 @@ loader:SetScript("OnEvent", function(self, event, ...)
 		ns.RestoreJumpXPBarFromSaved()
 		if C_Timer and C_Timer.After then
 			C_Timer.After(0.5, ns.RestoreJumpXPBarFromSaved)
-			C_Timer.After(0.5, ns.TryLateSavedAdopt)
-			C_Timer.After(2, ns.TryLateSavedAdopt)
-			C_Timer.After(5, ns.TryLateSavedAdopt)
 			C_Timer.After(1, function()
 				if ns.EnsureDB() then
-					-- Progress feats only Ã¢â‚¬â€ never location/situational (those need a real jump).
 					ns.CheckAchievementsGeneral()
 				end
 			end)
+			if C_Timer.NewTicker then
+				C_Timer.NewTicker(30, function()
+					ns.PersistStoreMirror()
+				end)
+			end
 		end
 	elseif event == "PLAYER_LOGOUT" then
-		-- Only flush into the real SavedVariable. If Forever never loaded it,
-		-- leave AJHSaved unset so the client does not write an empty table.
-		if type(AJHSaved) == "table" then
-			ns.EnsureDB()
-			ns.FlushPlayTime()
-		end
+		ns.EnsureDB()
+		ns.FlushPlayTime()
+		ns.PersistStoreMirror()
 	elseif event == "UNIT_AURA" then
 		if ns.RefreshCampBenefit() and S.panel and S.panel:IsShown() then
 			S.panel:Update()

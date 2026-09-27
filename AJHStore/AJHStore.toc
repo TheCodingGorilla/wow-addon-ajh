@@ -2,7 +2,7 @@
 ## Title: AJH Store
 ## Notes: SavedVariables companion for Archindula's Jump Habit (Forever load workaround).
 ## Author: Archindula
-## Version: 1.0.1
+## Version: 1.0.2
 ## SavedVariables: AJHStoreDB
 ## LoadSavedVariablesFirst: 1
 ## AllowLoadGameType: camelot
