@@ -1,4 +1,16 @@
-﻿# Changelog
+# Changelog
+
+## 1.3.5
+
+- Code tidy: split into AJH_Data / AJH / AJH_UI modules; compact location + feat tables
+- Remove unused diag subsystem; slim debug copy window and Camp Benefit scanners
+
+## 1.3.4
+
+- Performance: skip re-normalizing SavedVariables on every jump / UI tick
+- Performance: reuse jump-context tables; cache day-streak and feat counts
+- Performance: lighter guild whisper fan-out when guild addon channel works
+- Performance: minimap drag no longer writes SavedVariables every frame
 
 ## 1.3.3
 
